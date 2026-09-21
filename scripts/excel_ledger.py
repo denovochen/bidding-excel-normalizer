@@ -13,10 +13,9 @@ from ledger_core.artifacts import publish, validate_outputs
 from ledger_core.contract import LedgerError
 from ledger_core.normalize import build_outputs
 from ledger_core.workbook import inspect_workbooks, load_json, read_workbook
-from ledger_core.workflow import resolve, start as start_run
 
 
-PROGRESS_TITLES = ("读取并检查 Excel", "清洗并整理数据", "生成并校验结果", "交付结果文件")
+PROGRESS_TITLES = ("读取并检查 Excel", "清洗并整理数据", "生成并校验结果")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -40,13 +39,6 @@ def main(argv: list[str] | None = None) -> int:
     validate.add_argument("output", type=Path)
     companies = commands.add_parser("companies", help="只读输出全批次去重企业名单 JSON，供后续 Gateway 采集编排使用")
     companies.add_argument("output", type=Path)
-    resolution = commands.add_parser("resolve", help="接受宿主模型的本批双名称决定，继续到下一批或交付")
-    resolution.add_argument("--state", required=True, type=Path)
-    resolution.add_argument("--decisions", required=True, type=Path)
-    resolution.add_argument("--progress", action="store_true")
-    resume = commands.add_parser("resume", help="从任务状态恢复未完成的名称判断/发布，不重新创建任务")
-    resume.add_argument("--state", required=True, type=Path)
-    resume.add_argument("--progress", action="store_true")
     args = parser.parse_args(argv)
     active_step = 0
 
@@ -59,9 +51,7 @@ def main(argv: list[str] | None = None) -> int:
                           "title": PROGRESS_TITLES[step - 1]}, ensure_ascii=False), flush=True)
 
     try:
-        if args.command in {"resolve", "resume"}:
-            result = resolve(args.state, getattr(args, "decisions", None), progress)
-        elif args.command in {"validate", "companies"}:
+        if args.command in {"validate", "companies"}:
             checked = validate_outputs(args.output)
             result = {"kind": "validation", **checked}
             if args.command == "companies":
@@ -98,10 +88,13 @@ def main(argv: list[str] | None = None) -> int:
                                           "inspection": inspection}, ensure_ascii=False), flush=True)
                         return 3
                 prepared = build_outputs(books, plan)
+                progress(2, "completed")
+                progress(3, "in_progress")
                 output = args.output or Path.cwd() / "outputs" / ("excel-ledger-" + uuid.uuid4().hex)
-                result = start_run(output, books, plan, prepared, progress)
+                result = publish(output, *prepared)
+                progress(3, "completed")
         print(json.dumps(result, ensure_ascii=False, allow_nan=False), flush=True)
-        return 4 if result["kind"] == "name_review_required" else 0
+        return 0
     except (LedgerError, OSError, ValueError, TypeError, KeyError, csv.Error) as exc:
         if active_step:
             progress(active_step, "failed")

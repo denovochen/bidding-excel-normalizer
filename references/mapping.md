@@ -18,7 +18,7 @@
     "group_mode": "source",
     "bidder_separator": "single",
     "award_list_complete": false,
-    "award_mode": "name_match",
+    "award_mode": "auto",
     "summary_markers": ["项目汇总", "合计", "小计", "总计"],
     "non_tender_markers": ["未招投标", "未招标"]
   }]
@@ -43,12 +43,14 @@
 | bidder_separator=single | 每格一家企业 |
 | delimited | 括号外顿号/逗号/分号分隔；多行均有企业后缀则拆分，否则按折行处理 |
 | lines | 明确每行一家企业，按换行及名单分隔符拆分 |
-| award_mode=name_match | 本组中标名单去重后匹配；唯一模式，可省略该字段 |
+| award_mode=auto | 默认，由脚本检查单元格及组内证据选择行对应或名单匹配 |
+| name_match | 明确采用组内名单匹配，适用一格多家、合并、集中或重复展示 |
+| row_aligned | 已确认单企业行与中标明细逐行对应；脚本仍检查合并、名单、重复与跨行冲突 |
 
 不全表填充企业、报价、排名；名单顺序不是排名。代理可能覆盖多个组，不能默认按代理分组；同名项目应按实际块区分。缺少组边界的行隔离，勿猜跨文件归属。联合体保留复核，不能拆成独立投标人。
 
-中标列只填首行、逐行重复或跨行合并，均汇集为本组中标名单；按真实标段/数量锚点划分，不能跨组继承。中标格非空不证明该行企业中标；row_presence 已停用。项目汇总只作审计，不增加一组或企业记录。
+按真实标段/数量锚点分组，不能跨组继承。只填首行不证明该行企业中标，不能根据非空比例指定 row_aligned；优先 auto。一格多家、跨行合并、重复展示或整组行都有值时按组内名单匹配。row_presence 已停用。项目汇总只作审计，不增加一组或企业记录。
 
-完整中标结果设 award_list_complete=true；部分结果或无结果设 false。缺少结果不等于全部未中标。名称差异由后续小批量模型判断，不在 plan 中写公司名映射。summary_markers 完整匹配项目/企业/代理字段；non_tender_markers 仅保存原采购方式，不覆盖明确中标事实，不独立触发复核。
+完整中标结果设 award_list_complete=true；部分结果或无结果设 false。缺少结果不等于全部未中标。中标对应由脚本完成，输出保留投标名称；不调用模型判断名称，不在 plan 中写公司名映射。summary_markers 完整匹配项目/企业/代理字段；non_tender_markers 仅保存原采购方式，不覆盖明确中标事实，不独立触发复核。
 
 结构信息不足时仅局部 inspect；无需读取全表或源码。核对产物规则时才读 [输出契约](output-contract.md)。

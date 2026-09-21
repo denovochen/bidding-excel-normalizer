@@ -11,8 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .contract import FIELDS, OUTPUTS, LedgerError, name_key
-from .names import DECISIONS
+from .contract import FIELDS, OUTPUTS, VERSION, LedgerError, name_key
 
 
 def digest(path: Path) -> str:
@@ -41,6 +40,7 @@ def _write_csv(path: Path, rows: list[dict]) -> list[dict[str, Any]]:
 
 def publish(output: Path, final: list[dict], review: list[dict], ledger: dict) -> dict[str, Any]:
     _validate_name_decisions(ledger)
+    _validate_award_matches(ledger)
     output = output.expanduser().absolute()
     if output.is_symlink():
         raise LedgerError("输出目录不能是符号链接")
@@ -113,6 +113,7 @@ def validate_outputs(output: Path) -> dict[str, Any]:
     if ledger.get("schema_version") != 1:
         raise LedgerError("ledger 版本不受支持")
     _validate_name_decisions(ledger)
+    _validate_award_matches(ledger)
     for name in ("final.csv", "review_queue.csv"):
         path = output / name
         expected = ledger.get("artifacts", {}).get(name, {})
@@ -203,7 +204,7 @@ def _validate_name_decisions(ledger: dict) -> None:
         return  # 兼容只读校验已有 1.1/1.2 产物。
     pairs = {p["id"]: p for p in ledger["name_pairs"]}
     decisions = ledger.get("name_decisions", {})
-    if len(pairs) != len(ledger["name_pairs"]) or set(pairs) != set(decisions) or any(d not in DECISIONS for d in decisions.values()):
+    if len(pairs) != len(ledger["name_pairs"]) or set(pairs) != set(decisions) or any(d not in {"use_a", "use_b", "different", "uncertain"} for d in decisions.values()):
         raise LedgerError("名称对尚未全部作出有效决定，不能发布最终产物")
     for record in ledger["records"]:
         for change in record["corrections"]:
@@ -216,3 +217,43 @@ def _validate_name_decisions(ledger: dict) -> None:
             selected = pair["name_a"] if decision == "use_a" else pair["name_b"]
             if name_key(change["after"]) != name_key(selected):
                 raise LedgerError("纠错后名称不属于模型比较的两个名称")
+
+
+def _validate_award_matches(ledger: dict) -> None:
+    if "matching_policy" not in ledger:
+        if ledger.get("parser_version") == VERSION:
+            raise LedgerError("缺少确定性匹配策略")
+        return  # 旧版本产物仍可只读核验。
+    from .normalize import normalize_name
+    records = {r["id"]: r for r in ledger["records"]}
+    for record in records.values():
+        if not record["occurrences"] or any(
+            name_key(normalize_name(o["raw_company"], {})[0]) != name_key(record["company_name"])
+            for o in record["occurrences"]
+        ):
+            raise LedgerError("公司名称不等于原企业字段的格式清洗结果")
+        if any(c["rule"] not in {"format_normalization", "trailing_bid_annotation"} for c in record["corrections"]):
+            raise LedgerError("不允许通过中标匹配改写企业全称")
+    for group in ledger["groups"]:
+        if group["award_matching"]["mode"] not in {"group_match", "row_aligned"}:
+            raise LedgerError("中标匹配结构无效")
+        selected_ids = set()
+        for match in group["award_matches"]:
+            if match["status"] not in {"matched", "unresolved", "conflict"}:
+                raise LedgerError("中标对应状态无效")
+            if not match["award_cells"] or any(cell not in {a["cell"] for a in group["awards"]} for cell in match["award_cells"]):
+                raise LedgerError("中标对应缺少原始单元格")
+            for candidate in match["candidates"]:
+                record = records.get(candidate["record_id"])
+                if not record or record["group_id"] != group["id"] or candidate["name"] != record["company_name"]:
+                    raise LedgerError("中标候选跨组或名称不一致")
+            chosen = match["selected_record_id"]
+            if match["status"] == "matched":
+                record = records.get(chosen)
+                if (not record or chosen in selected_ids or record["group_id"] != group["id"] or
+                        match["selected_bidder_name"] != record["company_name"] or
+                        chosen not in {c["record_id"] for c in match["candidates"]}):
+                    raise LedgerError("中标对应重复、跨组或名称不一致")
+                selected_ids.add(chosen)
+            elif chosen is not None or match["selected_bidder_name"] is not None:
+                raise LedgerError("未解决的中标信息不得指定企业")

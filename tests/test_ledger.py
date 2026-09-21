@@ -93,12 +93,12 @@ class LedgerTests(unittest.TestCase):
         publish(self.directory / "out", f, r, ledger)
 
     def test_unmatched_singleton_does_not_win_just_because_award_cell_is_nonempty(self):
-        b, _ = self.book([["投标单位名称", "中标单位"], ["石家石家庄甲公司", "石家庄甲公司"]])
+        b, _ = self.book([["投标单位名称", "中标单位"], ["甲建设有限公司", "乙建设有限公司"]])
         f, r, ledger = self.build_auto(b)
-        self.assertEqual(f[0]["公司名称"], "石家石家庄甲公司")
+        self.assertEqual(f[0]["公司名称"], "甲建设有限公司")
         self.assertEqual(f[0]["中标与否"], "")
         self.assertTrue(r)
-        self.assertTrue(ledger["name_pairs"])
+        self.assertEqual(ledger["groups"][0]["award_matches"][0]["status"], "unresolved")
 
     def test_row_presence_formula_is_unknown_not_a_win(self):
         b, _ = self.book([["投标单位名称", "中标单位"], ["甲公司", "=A2"], ["乙公司", None]])
@@ -111,7 +111,7 @@ class LedgerTests(unittest.TestCase):
         b, _ = self.book([["项目名称", "投标单位名称", "投标单位数量", "中标单位"],
                           ["项目甲", "甲公司", 3, "丙公司"], [None, "乙公司"], [None, "丙公司"]], ("A2:A4", "D2:D4"))
         p = inspect_workbooks([b])["suggested_plan"]
-        self.assertEqual(p["sources"][0]["sheets"][0]["tables"][0]["award_mode"], "name_match")
+        self.assertEqual(p["sources"][0]["sheets"][0]["tables"][0]["award_mode"], "auto")
         f, r, ledger = self.build(b, p)
         self.assertEqual([x["中标与否"] for x in f], ["否", "否", "是"])
         self.assertFalse(r)
@@ -191,52 +191,47 @@ class LedgerTests(unittest.TestCase):
         self.assertTrue(validate_outputs(out)["validated"])
         self.assertEqual(hashlib.sha256(b.path.read_bytes()).hexdigest(), before)
 
-    def test_model_name_decision_is_applied_with_audit(self):
+    def test_name_matching_preserves_bidder_with_audit(self):
         b, p = self.book([["项目名称", "投标企业名单", "中标单位"],
                           ["项目甲", "甲建设有限公司、乙公司", "甲建设工程有限公司"]])
-        _, _, draft = self.build(b, p)
-        decisions = {x["id"]: "use_a" if x["name_b"] == "甲建设有限公司" else "different" for x in draft["name_pairs"]}
-        f, r, ledger = build_outputs([b], p, generated_at=TIME, name_decisions=decisions)
-        self.assertEqual(f[0]["公司名称"], "甲建设工程有限公司")
+        f, r, ledger = self.build(b, p)
+        self.assertEqual(f[0]["公司名称"], "甲建设有限公司")
         self.assertEqual([x["中标与否"] for x in f], ["是", "否"])
         self.assertFalse(r)
         self.assertEqual(ledger["records"][0]["occurrences"][0]["raw_company"], "甲建设有限公司")
-        self.assertEqual(ledger["records"][0]["corrections"][0]["rule"], "model_name_pair")
+        self.assertEqual(ledger["records"][0]["corrections"], [])
+        self.assertEqual(ledger["groups"][0]["award_matches"][0]["basis"], "unique_name_similarity")
         publish(self.directory / "out", f, r, ledger)
 
-    def test_model_award_decision_keeps_bidder_spelling_and_original_award(self):
+    def test_matching_keeps_bidder_spelling_and_original_award(self):
         b, p = self.book([["项目名称", "投标企业名单", "中标单位"],
-                          ["项目甲", "甲建筑工程有限公司、乙公司、丙公司", "甲建筑公司有限公司"]])
-        _, _, draft = self.build(b, p)
-        decisions = {x["id"]: "use_b" if x["name_b"] == "甲建筑工程有限公司" else "different" for x in draft["name_pairs"]}
-        f, r, ledger = build_outputs([b], p, generated_at=TIME, name_decisions=decisions)
+                          ["项目甲", "海岳建筑工程有限公司、乙公司、丙公司", "海岳建筑公司有限公司"]])
+        f, r, ledger = self.build(b, p)
         self.assertEqual([x["中标与否"] for x in f], ["是", "否", "否"])
         self.assertFalse(r)
-        self.assertEqual(ledger["groups"][0]["awards"][0]["raw"], "甲建筑公司有限公司")
-        self.assertEqual(ledger["groups"][0]["awards"][0]["name"], "甲建筑工程有限公司")
+        self.assertEqual(ledger["groups"][0]["awards"][0]["raw"], "海岳建筑公司有限公司")
+        self.assertEqual(ledger["groups"][0]["awards"][0]["name"], "海岳建筑公司有限公司")
         self.assertEqual(ledger["summary"]["record_count"], 3)
         publish(self.directory / "out", f, r, ledger)
 
-    def test_fuzzy_candidate_never_becomes_winner_or_rewrites_name(self):
-        b, p = self.book([["项目名称", "投标企业名单", "中标单位"], ["甲项目", "甲建设有限公司、乙公司", "甲建设工程有限公司"]])
+    def test_ambiguous_fuzzy_candidates_do_not_become_winners_or_rewrite_names(self):
+        b, p = self.book([["项目名称", "投标企业名单", "中标单位"], ["甲项目", "甲建设有限公司、甲建筑有限公司", "甲建设工程有限公司"]])
         f, r, ledger = self.build(b, p)
         self.assertEqual([x["中标与否"] for x in f], ["", ""])
         self.assertEqual(f[0]["公司名称"], "甲建设有限公司")
         self.assertEqual(len(r), 2)
         self.assertEqual(len(ledger["issues"]), 1)
         self.assertGreater(ledger["issues"][0]["candidates"][0]["name_similarity"], .7)
-        f, r, ledger = build_outputs([b], p, generated_at=TIME,
-                                    name_decisions={x["id"]: "uncertain" for x in ledger["name_pairs"]})
         publish(self.directory / "out", f, r, ledger)
 
-    def test_repeated_prefix_requires_a_model_decision(self):
+    def test_repeated_prefix_can_match_without_correcting_bidder(self):
         b, p = self.book([["项目名称", "投标企业名单", "中标单位"],
-                          ["项目甲", "石家石家庄甲公司、乙公司", "石家庄甲公司"]])
+                          ["项目甲", "东州东州市海岳塑料制品有限公司、乙公司", "东州市海岳塑料制品有限公司"]])
         f, r, ledger = self.build(b, p)
-        self.assertEqual(f[0]["公司名称"], "石家石家庄甲公司")
-        self.assertEqual(f[0]["中标与否"], "")
-        self.assertTrue(r)
-        self.assertTrue(any(x["name_a"] == "石家庄甲公司" and x["name_b"] == "石家石家庄甲公司" for x in ledger["name_pairs"]))
+        self.assertEqual(f[0]["公司名称"], "东州东州市海岳塑料制品有限公司")
+        self.assertEqual(f[0]["中标与否"], "是")
+        self.assertFalse(r)
+        self.assertEqual(ledger["records"][0]["corrections"], [])
 
     def test_repeated_prefix_collision_does_not_merge_two_bidders(self):
         b, p = self.book([["项目名称", "投标企业名单", "中标单位"],

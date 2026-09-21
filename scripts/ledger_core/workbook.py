@@ -184,11 +184,11 @@ HEADER_NAMES = {
     "bidder_name": ["投标单位名称", "投标企业名称", "投标人名称", "各投标企业名称(中标及未中标单位)", "投标企业名单", "投标人名单", "公司名称", "企业名称", "投标单位", "投标企业"],
     "bidder_count": ["投标单位数量", "投标企业数量"],
     "bidder_price": ["投标报价", "投标价格"],
-    "bidder_legal_person": ["投标单位法人", "投标企业法人"],
+    "bidder_legal_person": ["投标单位法人", "投标企业法人", "投标法人"],
     "award_name": ["中标单位", "中标企业", "中标企业名称", "中标单位名称", "中标人"],
     "award_status": ["中标与否", "是否中标", "中标状态"],
     "award_price": ["中标价(万元)", "中标金额", "中标价"],
-    "award_legal_person": ["中标单位法人", "中标企业法人"],
+    "award_legal_person": ["中标单位法人", "中标企业法人", "中标法人"],
     "rank": ["投标排名", "排名"], "notes": ["备注", "说明"],
 }
 
@@ -254,7 +254,7 @@ def suggest_table(sheet: Sheet) -> dict[str, Any] | None:
         **({"group_start_field": "bidder_count"} if not list_layout and "bidder_count" in matches else {}),
         "bidder_separator": "delimited" if list_layout else "single",
         "award_list_complete": "award_name" in matches,
-        "award_mode": "name_match",
+        "award_mode": "auto",
         "summary_markers": ["项目汇总", "合计", "小计", "总计"],
         "non_tender_markers": ["未招投标", "未招标"],
     }
@@ -408,8 +408,8 @@ def validate_plan(plan: dict[str, Any], books: list[Workbook]) -> None:
                     raise LedgerError("lot 分组需要标段字段")
                 if table["bidder_separator"] not in {"single", "delimited", "lines"}:
                     raise LedgerError("bidder_separator 无效")
-                if table.get("award_mode", "name_match") != "name_match":
-                    raise LedgerError("1.3 已停用同行非空判断，请将 award_mode 改为 name_match")
+                if table.get("award_mode", "auto") not in {"auto", "name_match", "row_aligned"}:
+                    raise LedgerError("row_presence 已停用；award_mode 必须为 auto/name_match/row_aligned")
                 if type(table["award_list_complete"]) is not bool:
                     raise LedgerError("award_list_complete 必须为布尔值")
                 for key in ("summary_markers", "non_tender_markers"):

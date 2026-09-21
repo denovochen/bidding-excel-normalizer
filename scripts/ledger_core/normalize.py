@@ -7,9 +7,9 @@ from typing import Any
 
 from .contract import FIELDS, VERSION, LedgerError, clean, column_number, coordinate, name_key, stable_id, text
 from .workbook import HEADER_NAMES, Workbook, Sheet, validate_plan
-from .names import DECISIONS, match_group
+from .names import POLICY, match_group
 
-EMPTY_NAMES = {"", "/", "-", "—", "无", "暂无", "未招标", "未招投标", "未确定", "待定"}
+EMPTY_NAMES = {"", "/", "-", "—", "无", "暂无", "未招标", "未招投标", "未确定", "待定", "未中标", "否", "不适用", "待招标", "未开标"}
 COMPANY_END = re.compile(r"(?:公司|工程队|工程处|合作社|事务所|中心|研究院|设计院|厂|经营部)$")
 
 
@@ -52,6 +52,8 @@ def aliases_from_json(payload: dict[str, Any]) -> dict[str, dict[str, str]]:
 
 
 def normalize_name(raw: str, aliases: dict[str, dict[str, str]]) -> tuple[str, list[dict[str, str]]]:
+    if aliases:
+        raise LedgerError("不接受全局公司名称映射")
     # 两端均为汉字的单企业折行不应向全称插入空格。
     folded = re.sub(r"(?<=[\u3400-\u9fff])[\r\n]+\s*(?=[\u3400-\u9fff])", "", raw)
     name = clean(folded)
@@ -63,11 +65,6 @@ def normalize_name(raw: str, aliases: dict[str, dict[str, str]]) -> tuple[str, l
         changed = name[:-2]
         actions.append({"rule": "trailing_bid_annotation", "before": name, "after": changed,
                         "basis": "完整企业后缀后附加的投标标注"})
-        name = changed
-    alias = aliases.get(name_key(name))
-    if alias:
-        changed = clean(alias["to"])
-        actions.append({"rule": "confirmed_alias", "before": name, "after": changed, "basis": alias["basis"]})
         name = changed
     return name, actions
 
@@ -140,13 +137,25 @@ def _issue(code: str, message: str, group: dict[str, Any] | None, **extra: Any) 
             "record_ids": [], "final_sequences": [], "review_sequences": [], **extra}
 
 
+def _vertical_merge(sheet: Sheet, row: int, role: str, columns: dict) -> bool:
+    if role not in columns:
+        return False
+    col = column_number(columns[role])
+    return any(top < bottom and top <= row <= bottom for top, _, bottom, _ in sheet.merge_columns.get(col, []))
+
+
 def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_index: int,
                   aliases: dict[str, dict[str, str]], project_scope_index: int | None = None) -> tuple[list, list, list, list]:
     projects, groups, issues, row_audit = {}, {}, [], []
     current_project = None
     current_group = None
     columns = table["columns"]
-    award_mode = "name_match"
+    award_mode = table.get("award_mode", "auto")
+    price_units = {}
+    for role in ("bidder_price", "award_price"):
+        if role in columns:
+            header = " ".join(text(sheet.resolved(r, column_number(columns[role]))[0].value) for r in table["header_rows"])
+            price_units[role] = next((u for u in ("亿元", "万元", "元") if u in header), "")
     project_role = "project_name" if "project_name" in columns else "project_code" if "project_code" in columns else None
     project_col = column_number(columns[project_role]) if project_role else None
     context_roles = ("project_name", "project_code", "project_year", "project_owner", "project_serial")
@@ -237,6 +246,8 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
             "scope_type": "roster" if group_mode == "source" else "context" if context_record else "business",
             "company_role": company_role,
             "award_mode": award_mode,
+            "price_units": price_units,
+            "price_unit_assumption": "未标单位的一侧沿用另一侧" if len(price_units) == 2 and bool(price_units.get("bidder_price")) != bool(price_units.get("award_price")) else "",
         })
         group = current_group
         for role in ("lot_name", "lot_code"):
@@ -267,7 +278,10 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
                 if not any(name_key(a["name"]) == name_key(name) and a["cell"] == cells.get("award_name") for a in group["awards"]):
                     group["awards"].append({"raw": raw, "name": name, "cell": cells.get("award_name"),
                                             "changes": changes, "legal_person": values.get("award_legal_person", ""),
-                                            "price": values.get("award_price", "")})
+                                            "price": values.get("award_price", ""),
+                                            "row": sheet.resolved(row, column_number(columns["award_name"]))[1],
+                                            "merged": _vertical_merge(sheet, row, "award_name", columns),
+                                            "single_name": len(award_names) == 1})
         try:
             tokens = split_names(source_company, table["bidder_separator"])
         except LedgerError as exc:
@@ -285,7 +299,8 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
             group["records"].append({
                 "id": stable_id("record", book.sha256, sheet.index, table_index, row, index),
                 "name": name, "project_id": project_id, "group_id": gid,
-                "occurrences": [{**occurrence, "fragment_index": index, "raw_company": raw, "company_role": company_role}],
+                "occurrences": [{**occurrence, "fragment_index": index, "raw_company": raw, "company_role": company_role,
+                                 "single_bidder_row": company_role == "bidder_name" and len(tokens) == 1 and not _vertical_merge(sheet, row, "bidder_name", columns)}],
                 "changes": changes, "award_status": "", "rank": values.get("rank", "") if len(tokens) == 1 else "",
                 "explicit_award_status": values.get("award_status", "") if len(tokens) == 1 else "",
                 "context_only": context_record,
@@ -296,8 +311,7 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
     return list(projects.values()), list(groups.values()), issues, row_audit
 
 
-def finish_group(group: dict[str, Any], issues: list[dict[str, Any]],
-                 decisions: dict[str, str], pairs: dict[str, dict]) -> None:
+def finish_group(group: dict[str, Any], issues: list[dict[str, Any]]) -> None:
     signals = set(group["procurement_signals"])
     uncertain = "uncertain" in signals or {"not_non_tender", "non_tender"}.issubset(signals)
     group["procurement_status"] = "uncertain" if uncertain else "non_tender" if "non_tender" in signals else (
@@ -325,7 +339,7 @@ def finish_group(group: dict[str, Any], issues: list[dict[str, Any]],
     if len(counts) > 1 or (counts and counts != {len(group["records"])}):
         issues.append(_issue("BIDDER_COUNT_MISMATCH", "声明投标数量与整理后的企业数量不一致", group,
                              declared_counts=sorted(counts), actual_count=len(group["records"])))
-    matched, unresolved = match_group(group, decisions, pairs)
+    matched, unresolved = match_group(group)
     for problem in unresolved:
         issues.append(_issue(problem.pop("code"), problem.pop("message"), group, **problem))
     if not group["records"] and not any(i.get("standalone") and i["group_id"] == group["id"] for i in issues):
@@ -358,16 +372,12 @@ def finish_group(group: dict[str, Any], issues: list[dict[str, Any]],
 
 
 def build_outputs(books: list[Workbook], plan: dict[str, Any], alias_payload: dict[str, Any] | None = None,
-                  generated_at: str | None = None, name_decisions: dict[str, str] | None = None) -> tuple[list[dict], list[dict], dict]:
+                  generated_at: str | None = None) -> tuple[list[dict], list[dict], dict]:
     validate_plan(plan, books)
     alias_payload = alias_payload or {"schema_version": 1, "aliases": []}
     if aliases_from_json(alias_payload):
-        raise LedgerError("1.3 不接受全局公司名映射；请使用本次任务的名称对决策")
+        raise LedgerError("不接受全局公司名映射；输出保留投标单位名称")
     aliases = {}
-    decisions = name_decisions or {}
-    if any(value not in DECISIONS for value in decisions.values()):
-        raise LedgerError("名称对决定无效")
-    pairs: dict[str, dict] = {}
     timestamp = generated_at or datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
     try:
         if datetime.fromisoformat(timestamp).utcoffset() is None:
@@ -387,9 +397,7 @@ def build_outputs(books: list[Workbook], plan: dict[str, Any], alias_payload: di
                 projects.extend(p); groups.extend(g); issues.extend(i); row_audit.extend(audit)
     projects = list({p["id"]: p for p in projects}.values())
     for group in groups:
-        finish_group(group, issues, decisions, pairs)
-    if set(decisions) - set(pairs):
-        raise LedgerError("决定包含不属于本次输入的名称对")
+        finish_group(group, issues)
     project_by_id = {p["id"]: p for p in projects}
     book_by_id = {b.source_id: b for b in books}
     # 分组问题对应整个组，避免只标候选而把其他企业误写成已确认未中标。
@@ -421,6 +429,9 @@ def build_outputs(books: list[Workbook], plan: dict[str, Any], alias_payload: di
                 evidence.append("原中标字段=" + "；".join(f"{a['cell']}:{a['raw']}" for a in group["awards"]))
             if record["changes"]:
                 evidence.append("清洗=" + "；".join(f"{c['before']}→{c['after']}({c['rule']})" for c in record["changes"]))
+            for matched in group["award_matches"]:
+                if matched["selected_record_id"] == record["id"]:
+                    evidence.append(f"中标对应={matched['original_award']}→{record['name']}({matched['basis']})")
             if group["non_tender"]:
                 evidence.append("原表注明未招投标")
             row = dict.fromkeys(FIELDS, "")
@@ -466,8 +477,7 @@ def build_outputs(books: list[Workbook], plan: dict[str, Any], alias_payload: di
         "schema_version": 1, "parser_version": VERSION, "generated_at": timestamp,
         "sources": [{"id": b.source_id, "file_name": b.path.name, "sha256": b.sha256, "size": b.size,
                      "format": b.format, "sheets": [s.name for s in b.sheets]} for b in books],
-        "mapping": plan, "alias_rules": alias_payload,
-        "name_pairs": list(pairs.values()), "name_decisions": decisions,
+        "mapping": plan, "matching_policy": dict(POLICY),
         "summary": {
             "project_count": len(projects), "explicit_lot_count": sum(bool(g["lot_name"] or g["lot_code"]) for g in groups),
             "group_count": len(groups), "bidding_group_count": sum(g["procurement_status"] == "bidding" for g in groups),
@@ -483,7 +493,8 @@ def build_outputs(books: list[Workbook], plan: dict[str, Any], alias_payload: di
         "projects": projects, "groups": [{k: v for k, v in g.items() if k != "records"} for g in groups],
         "records": audit_records, "issues": issues, "row_audit": row_audit, "skipped_sheets": skipped,
         "unique_companies": list(unique.values()),
-        "notes": ["置信度表示提取可靠程度，名称相似度仅在 issues.candidates 中表示字符串接近程度。",
+        "notes": ["置信度表示提取可靠程度；名称相似度只表示字符串接近程度，组内对应不证明工商实体一致或法定更名。",
+                  "存在投标列时公司名称仅来自投标列；中标名和对应依据保留在 groups.award_matches，不回写或纠正投标全称。",
                   "unique_companies 按 Gitee 客户端的 NFKC、去空白、casefold 规则从 final 非空公司名称去重；包括待复核名称，可供后续采集编排读取。",
                   "业务字段缺失仅留空，不伪造项目/标段归属，也不因缺少中标字段要求用户补充。",
                   "XLS 读取缓存值，xlrd 不提供可靠公式文本标记；本工具不计算公式。",
