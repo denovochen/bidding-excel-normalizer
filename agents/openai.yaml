@@ -1,0 +1,4 @@
+interface:
+  display_name: "招投标 Excel 台账整理"
+  short_description: "按招标组匹配中标名单，少量名称差异自动判断，缺失留空并交付三个文件"
+  default_prompt: "使用 $bidding-excel-normalizer 自动整理我上传的 Excel，缺失字段留空，处理中不提问，直接交付三个产物。"

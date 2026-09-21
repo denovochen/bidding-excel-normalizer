@@ -1,0 +1,28 @@
+# 本地缓存与环境
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.idea/
+.vscode/
+
+# 凭据不纳入版本管理
+.env
+.env.*
+secrets/
+*.pem
+*.key
+
+# 原始业务文件、产物与任务状态不纳入版本管理
+*.xls
+*.xlsx
+*.csv
+*.zip
+outputs/
+.excel-ledger-*/
+.excel-ledger-work-*/
+ledger.json
+state.json
+plan.json
