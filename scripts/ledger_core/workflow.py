@@ -68,9 +68,10 @@ def _handoff(path: Path, state: dict) -> dict:
     batch = _batch(state)
     if not batch:
         return {"kind": "ready_to_finalize", "state": str(path)}
-    return {"kind": "name_review_required", "state": str(path), **batch,
+    decisions_path = path.with_name(f"decisions-{batch['batch_id']}.json")
+    return {"kind": "name_review_required", "state": str(path), "decisions_path": str(decisions_path), **batch,
             "remaining_pairs": sum(p["id"] not in state["decisions"] for p in state["pairs"]),
-            "message": "宿主模型按 name-review.md 仅比较两个名字；不问用户，写决定文件后调用 resolve。"}
+            "message": "按 name-review.md 比较名字，将决定写到 decisions_path；resolve 的 --decisions 使用同一完整路径。"}
 
 
 def start(output: Path, books: list, plan: dict, prepared: tuple, progress: Progress) -> dict:

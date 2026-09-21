@@ -9,12 +9,12 @@
 - different：不同名称，不合并。
 - uncertain：无法确定，保留复核。
 
-回答本批全部 id，各一次；保持 batch_id 原样。把 JSON 写到输出目录以外的临时文件，不附解释、其他字段或新名字：
+回答本批全部 id，各一次；保持 batch_id 原样。把 JSON 写到脚本返回的 `decisions_path`（位于 `state.json` 同目录），不自选 `/tmp` 或相对路径，不附解释、其他字段或新名字：
 
 ```json
 {"batch_id":"原批次ID","decisions":[{"id":"原名称对ID","decision":"use_b"}]}
 ```
 
-执行 `python scripts/excel_ledger.py resolve --state <返回的state路径> --decisions <决定文件> --progress`。收到下一批继续；result 时交付。恢复用 `resume --state <路径> --progress`，不重新 run。同一已接受批次不可改写，重复提交相同决定是幂等操作。
+执行 `python scripts/excel_ledger.py resolve --state <返回的state完整路径> --decisions <返回的decisions_path完整路径>`。写文件和执行命令使用同一路径；收到下一批使用新返回的路径继续，result 时交付。恢复用 `resume --state <路径>`，不重新 run；旧任务也可通过 resume 获取 decisions_path。同一已接受批次不可改写，重复提交相同决定是幂等操作。
 
 脚本检查目标名称、组内唯一对应和碰撞，只在本次相关组应用；冲突/不确定继续进入复核，不能强求清零。每批最多6对/4000字符，相同名称对只判断一次；不把全部企业名单或 ledger 读进上下文。

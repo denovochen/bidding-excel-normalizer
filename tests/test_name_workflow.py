@@ -53,7 +53,7 @@ class NameWorkflowTests(unittest.TestCase):
         return path, output, handoff
 
     def answer(self, handoff, decision="use_b"):
-        path = self.root / (handoff["batch_id"] + ".json")
+        path = Path(handoff["decisions_path"])
         payload = {"batch_id": handoff["batch_id"], "decisions": [{"id": p["id"], "decision": decision} for p in handoff["pairs"]]}
         path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         return path
@@ -74,6 +74,20 @@ class NameWorkflowTests(unittest.TestCase):
         self.assertTrue(all(set(p) == {"id", "name_a", "name_b"} for p in handoff["pairs"]))
         self.assertNotIn((2, "completed"), self.events)
         self.assertNotIn((3, "in_progress"), self.events)
+
+    def test_decision_path_stays_with_state_and_separates_batches(self):
+        _, output, handoff = self.begin(8)
+        state = Path(handoff["state"])
+        first_path = Path(handoff["decisions_path"])
+        self.assertTrue(first_path.is_absolute())
+        self.assertEqual(first_path.parent, state.parent)
+        self.assertEqual(first_path.parent.parent, output.parent.resolve())
+        self.assertNotEqual(first_path.parent, output.resolve())
+        self.assertFalse(first_path.exists())
+        next_batch = resolve(state, self.answer(handoff), self.progress)
+        self.assertNotEqual(next_batch["decisions_path"], str(first_path))
+        self.assertTrue(first_path.is_file())
+        self.assertEqual(resolve(state, None, self.progress)["decisions_path"], next_batch["decisions_path"])
 
     def test_batches_are_bounded_and_each_pair_is_asked_once(self):
         _, output, handoff = self.begin(14)
@@ -205,7 +219,10 @@ class NameWorkflowTests(unittest.TestCase):
         messages = [json.loads(line) for line in first.stdout.splitlines()]
         handoff = messages[-1]
         self.assertEqual(messages[-2]["status"], "in_progress")
-        second = subprocess.run(cli + ["resolve", "--state", handoff["state"], "--decisions", str(self.answer(handoff)), "--progress"], text=True, capture_output=True)
+        other_cwd = self.root / "another-working-directory"
+        other_cwd.mkdir()
+        second = subprocess.run(cli + ["resolve", "--state", handoff["state"], "--decisions", str(self.answer(handoff)), "--progress"],
+                                cwd=other_cwd, text=True, capture_output=True)
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(json.loads(second.stdout.splitlines()[-1])["kind"], "result")
         self.assertEqual({p.name for p in output.iterdir()}, {"final.csv", "review_queue.csv", "ledger.json"})
