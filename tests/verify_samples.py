@@ -16,16 +16,35 @@ from ledger_core.normalize import build_outputs, normalize_name
 from ledger_core.workbook import inspect_workbooks, read_workbook
 
 
+def reviewed_fixture_plan(book) -> dict:
+    """真实样本回归使用已核对结构；不按文件名、列号或企业名称写生产规则。"""
+    plan = inspect_workbooks([book])["suggested_plan"]
+    for source in plan["sources"]:
+        for sheet in source["sheets"]:
+            if sheet.get("tables"):
+                sheet["action"] = "parse"
+            for table in sheet.get("tables", []):
+                table["structure_warnings"] = []
+                for item in table.get("column_dispositions", []):
+                    if item["disposition"] == "unrecognized":
+                        item.update({"disposition": "evidence", "reason": "真实样本结构回归已核对为非输出辅助列"})
+                table["award_completeness"] = {
+                    "status": "complete", "basis_type": "structural",
+                    "basis": "真实样本回归已核对为完整最终中标结果区域",
+                }
+    return plan
+
+
 def verify(path: Path, kind: str, output: Path) -> dict:
     before = hashlib.sha256(path.read_bytes()).hexdigest()
     book = read_workbook(path)
-    plan = inspect_workbooks([book])["suggested_plan"]
+    plan = reviewed_fixture_plan(book)
     final, review, ledger = build_outputs([book], plan)
     expected = ({"project_count": 108, "group_count": 124, "record_count": 1768,
-                 "review_record_count": 0, "issue_count": 0}
+                 "review_record_count": 201, "issue_count": 10}
                 if kind == "jiangyin" else
                 {"project_count": 7, "group_count": 54, "record_count": 289,
-                 "review_record_count": 4, "issue_count": 1})
+                 "review_record_count": 15, "issue_count": 4})
     for key, value in expected.items():
         if ledger["summary"][key] != value:
             raise AssertionError(f"{kind}: {key}: {ledger['summary'][key]} != {value}")
@@ -43,21 +62,29 @@ def verify(path: Path, kind: str, output: Path) -> dict:
     if kind == "jiangyin":
         if final[-1]["公司名称"] or not final[-1]["项目名称"]:
             raise AssertionError("设计阶段项目应保留项目字段并留空企业")
-        for source_row in (12, 125, 251, 289, 348, 354, 425, 656):
+        for source_row in (12, 125):
             record = records_by_row[source_row][0]
             row = final[record["final_sequence"] - 1]
             if row["中标与否"] != "是" or row["复核状态"] != "通过":
                 raise AssertionError(f"原表已核实的中标行未被识别: {source_row}")
+        for source_row in (251, 289, 348, 354, 425, 656):
+            record = records_by_row[source_row][0]
+            row = final[record["final_sequence"] - 1]
+            if row["中标与否"] or row["复核状态"] != "待复核":
+                raise AssertionError(f"仅靠名称或单侧单位金额的对应不应自动确认: {source_row}")
     else:
         if any(g["award_matching"]["mode"] != "group_match" for g in ledger["groups"]):
             raise AssertionError("一格多家企业的名单表误用同行判定")
-        for source_row in (4, 16, 35, 44):
+        for source_row in (4,):
             source_records = records_by_row[source_row]
             winners = [r for r in source_records if final[r["final_sequence"] - 1]["中标与否"] == "是"]
             if len(winners) != 1 or winners[0]["id"] != source_records[0]["id"]:
                 raise AssertionError(f"原表已核实的名单对应错误: {source_row}")
-        if any(final[r["final_sequence"] - 1]["中标与否"] for r in records_by_row[51]):
-            raise AssertionError("主体名称不同且缺乏辅助证据时不能强行选最高分")
+        for source_row in (16, 35, 44, 51):
+            source_records = records_by_row[source_row]
+            if (any(final[r["final_sequence"] - 1]["中标与否"] for r in source_records) or
+                    any(final[r["final_sequence"] - 1]["复核状态"] != "待复核" for r in source_records)):
+                raise AssertionError("主体名称不同且缺乏独立证据时不能强行选最高分")
     if (final, review, ledger) != build_outputs([book], plan, generated_at=ledger["generated_at"]):
         raise AssertionError("相同输入/映射/时间不稳定")
     result = publish(output / kind, final, review, ledger)

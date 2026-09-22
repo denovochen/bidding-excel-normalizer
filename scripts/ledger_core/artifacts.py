@@ -148,6 +148,11 @@ def validate_outputs(output: Path) -> dict[str, Any]:
             raise LedgerError("记录关联未知问题")
         if bool(record["issue_ids"]) != (row["复核状态"] == "待复核"):
             raise LedgerError("复核状态与问题集合不一致")
+        confidence = record.get("confidence")
+        if ledger.get("parser_version") == VERSION:
+            if (not isinstance(confidence, dict) or confidence.get("meaning") != "rule_reliability_not_probability" or
+                    confidence.get("score") != float(row["置信度"])):
+                raise LedgerError("置信度与逐条规则依据不一致")
         sequence = record["review_sequence"]
         if sequence is None:
             if row["复核状态"] == "待复核":
@@ -237,6 +242,12 @@ def _validate_award_matches(ledger: dict) -> None:
     for group in ledger["groups"]:
         if group["award_matching"]["mode"] not in {"group_match", "row_aligned"}:
             raise LedgerError("中标匹配结构无效")
+        completeness = group.get("award_completeness")
+        if ledger.get("parser_version") == VERSION and (
+                not isinstance(completeness, dict) or completeness.get("status") not in {"complete", "partial", "unknown"} or
+                completeness.get("basis_type") not in {"explicit", "structural", "none"} or
+                type(completeness.get("verified")) is not bool):
+            raise LedgerError("中标完整性审计无效")
         selected_ids = set()
         for match in group["award_matches"]:
             if match["status"] not in {"matched", "unresolved", "conflict"}:
@@ -252,7 +263,9 @@ def _validate_award_matches(ledger: dict) -> None:
                 record = records.get(chosen)
                 if (not record or chosen in selected_ids or record["group_id"] != group["id"] or
                         match["selected_bidder_name"] != record["company_name"] or
-                        chosen not in {c["record_id"] for c in match["candidates"]}):
+                        chosen not in {c["record_id"] for c in match["candidates"]} or
+                        (ledger.get("parser_version") == VERSION and
+                         match["basis"] not in {"exact_name", "unique_person_amount", "row_alignment"})):
                     raise LedgerError("中标对应重复、跨组或名称不一致")
                 selected_ids.add(chosen)
             elif chosen is not None or match["selected_bidder_name"] is not None:

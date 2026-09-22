@@ -7,7 +7,7 @@ import re
 import unicodedata
 from datetime import datetime
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 FIELDS = [
     "序号", "项目名称", "项目编号", "标段名称", "标段编号", "公司名称", "中标与否", "投标排名",
     "文件类别", "依据文件路径", "来源页码", "提取方式", "证据文本", "置信度", "复核状态", "解析结果生成日期时间",
@@ -23,6 +23,18 @@ BUSINESS_ROLES = {"project_name", "project_code", "lot_name", "lot_code", "bidde
 
 class LedgerError(ValueError):
     """输入、映射或产物校验失败；不得伪装为成功。"""
+
+
+class MappingRevisionRequired(LedgerError):
+    """结构映射需要局部修订；调用方可返回有界证据而不发布结果。"""
+
+    def __init__(self, message: str, evidence: dict | None = None):
+        super().__init__(message)
+        self.evidence = evidence or {}
+
+
+class RecoverableWorkbookError(LedgerError):
+    """单个工作簿无法解析，但同批其他工作簿仍可继续交付。"""
 
 
 def text(value: object) -> str:

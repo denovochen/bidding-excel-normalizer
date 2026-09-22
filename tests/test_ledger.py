@@ -52,7 +52,8 @@ class LedgerTests(unittest.TestCase):
         for source in plan["sources"]:
             for sheet in source["sheets"]:
                 for table in sheet.get("tables", []):
-                    table["award_list_complete"] = True
+                    table["award_completeness"] = {"status": "complete", "basis_type": "structural",
+                                                   "basis": "测试夹具声明为完整最终结果区域"}
                     # 既有名称匹配测试显式使用该模式；逐行模式另用 inspect 的实际建议验证。
                     table["award_mode"] = "name_match"
         return b, plan
@@ -61,7 +62,13 @@ class LedgerTests(unittest.TestCase):
         return build_outputs([book], plan, self.aliases, TIME)
 
     def build_auto(self, book):
-        return self.build(book, inspect_workbooks([book])["suggested_plan"])
+        plan = inspect_workbooks([book])["suggested_plan"]
+        for source in plan["sources"]:
+            for sheet in source["sheets"]:
+                for table in sheet.get("tables", []):
+                    table["award_completeness"] = {"status": "complete", "basis_type": "structural",
+                                                   "basis": "测试夹具声明为完整最终结果区域"}
+        return self.build(book, plan)
 
     def test_group_match_rejects_global_alias_configuration(self):
         b, p = self.book([["项目名称", "投标单位名称", "中标单位"],
@@ -112,6 +119,8 @@ class LedgerTests(unittest.TestCase):
                           ["项目甲", "甲公司", 3, "丙公司"], [None, "乙公司"], [None, "丙公司"]], ("A2:A4", "D2:D4"))
         p = inspect_workbooks([b])["suggested_plan"]
         self.assertEqual(p["sources"][0]["sheets"][0]["tables"][0]["award_mode"], "auto")
+        p["sources"][0]["sheets"][0]["tables"][0]["award_completeness"] = {
+            "status": "complete", "basis_type": "structural", "basis": "测试夹具声明为完整最终结果区域"}
         f, r, ledger = self.build(b, p)
         self.assertEqual([x["中标与否"] for x in f], ["否", "否", "是"])
         self.assertFalse(r)
@@ -196,19 +205,19 @@ class LedgerTests(unittest.TestCase):
                           ["项目甲", "甲建设有限公司、乙公司", "甲建设工程有限公司"]])
         f, r, ledger = self.build(b, p)
         self.assertEqual(f[0]["公司名称"], "甲建设有限公司")
-        self.assertEqual([x["中标与否"] for x in f], ["是", "否"])
-        self.assertFalse(r)
+        self.assertEqual([x["中标与否"] for x in f], ["", ""])
+        self.assertEqual(len(r), 2)
         self.assertEqual(ledger["records"][0]["occurrences"][0]["raw_company"], "甲建设有限公司")
         self.assertEqual(ledger["records"][0]["corrections"], [])
-        self.assertEqual(ledger["groups"][0]["award_matches"][0]["basis"], "unique_name_similarity")
+        self.assertEqual(ledger["groups"][0]["award_matches"][0]["status"], "unresolved")
         publish(self.directory / "out", f, r, ledger)
 
     def test_matching_keeps_bidder_spelling_and_original_award(self):
         b, p = self.book([["项目名称", "投标企业名单", "中标单位"],
                           ["项目甲", "海岳建筑工程有限公司、乙公司、丙公司", "海岳建筑公司有限公司"]])
         f, r, ledger = self.build(b, p)
-        self.assertEqual([x["中标与否"] for x in f], ["是", "否", "否"])
-        self.assertFalse(r)
+        self.assertEqual([x["中标与否"] for x in f], ["", "", ""])
+        self.assertEqual(len(r), 3)
         self.assertEqual(ledger["groups"][0]["awards"][0]["raw"], "海岳建筑公司有限公司")
         self.assertEqual(ledger["groups"][0]["awards"][0]["name"], "海岳建筑公司有限公司")
         self.assertEqual(ledger["summary"]["record_count"], 3)
@@ -229,8 +238,8 @@ class LedgerTests(unittest.TestCase):
                           ["项目甲", "东州东州市海岳塑料制品有限公司、乙公司", "东州市海岳塑料制品有限公司"]])
         f, r, ledger = self.build(b, p)
         self.assertEqual(f[0]["公司名称"], "东州东州市海岳塑料制品有限公司")
-        self.assertEqual(f[0]["中标与否"], "是")
-        self.assertFalse(r)
+        self.assertEqual(f[0]["中标与否"], "")
+        self.assertEqual(len(r), 2)
         self.assertEqual(ledger["records"][0]["corrections"], [])
 
     def test_repeated_prefix_collision_does_not_merge_two_bidders(self):
@@ -257,7 +266,8 @@ class LedgerTests(unittest.TestCase):
 
     def test_incomplete_award_list_never_marks_losers(self):
         b, p = self.book([["项目名称", "投标企业名单", "中标单位"], ["甲项目", "甲公司、乙公司", "甲公司"]])
-        p["sources"][0]["sheets"][0]["tables"][0]["award_list_complete"] = False
+        p["sources"][0]["sheets"][0]["tables"][0]["award_completeness"] = {
+            "status": "partial", "basis_type": "explicit", "basis": "原表明确说明仅记录部分中标结果"}
         f, _, _ = self.build(b, p)
         self.assertEqual([r["中标与否"] for r in f], ["是", ""])
 
@@ -531,11 +541,18 @@ class LedgerTests(unittest.TestCase):
         self.assertFalse(r)
         publish(self.directory / "out", f, r, ledger)
 
-    def test_run_cli_completes_roster_without_a_plan_or_question(self):
+    def test_run_cli_reviews_roster_structure_then_completes_without_question(self):
         b, _ = self.book([["序号", "投标单位名称"], [1, "甲公司"], [2, "甲公司"], [3, "乙公司"]])
         output = self.directory / "direct-output"
+        first = subprocess.run([sys.executable, "-B", str(ROOT / "scripts" / "excel_ledger.py"), "run",
+                                str(b.path), "--output", str(output)], capture_output=True, text=True)
+        self.assertEqual(first.returncode, 3)
+        plan_path = self.directory / "roster-plan.json"
+        plan_path.write_text(json.dumps(json.loads(first.stdout)["inspection"]["suggested_plan"], ensure_ascii=False),
+                             encoding="utf-8")
         result = subprocess.run([sys.executable, "-B", str(ROOT / "scripts" / "excel_ledger.py"), "run",
-                                 str(b.path), "--output", str(output)], capture_output=True, text=True)
+                                 str(b.path), "--plan", str(plan_path), "--output", str(output)],
+                                capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["kind"], "result")
         names = subprocess.run([sys.executable, "-B", str(ROOT / "scripts" / "excel_ledger.py"), "companies", str(output)],
@@ -547,8 +564,11 @@ class LedgerTests(unittest.TestCase):
     def test_progress_reports_only_completed_script_stages_before_result(self):
         b, _ = self.book([["投标单位名称"], ["甲公司"]])
         out = self.directory / "progress-output"
+        plan_path = self.directory / "progress-plan.json"
+        plan_path.write_text(json.dumps(inspect_workbooks([b])["suggested_plan"], ensure_ascii=False), encoding="utf-8")
         result = subprocess.run([sys.executable, "-B", str(ROOT / "scripts" / "excel_ledger.py"), "run",
-                                 str(b.path), "--output", str(out), "--progress"], capture_output=True, text=True)
+                                 str(b.path), "--plan", str(plan_path), "--output", str(out), "--progress"],
+                                capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         messages = [json.loads(line) for line in result.stdout.splitlines()]
         events = messages[:-1]
@@ -676,6 +696,154 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(json.loads(result.stderr)["kind"], "error")
         self.assertFalse((self.directory / "out").exists())
+
+    def test_unknown_bidder_column_requires_review_and_is_not_silently_dropped(self):
+        b, plan = self.book([["项目名称", "参标单位", "中标单位"], ["项目甲", "甲公司", "甲公司"]])
+        output = self.directory / "unknown-bidder-output"
+        entry = subprocess.run([sys.executable, "-B", str(ROOT / "scripts" / "excel_ledger.py"), "run",
+                                str(b.path), "--output", str(output)], capture_output=True, text=True)
+        self.assertEqual(entry.returncode, 3)
+        self.assertFalse(output.exists())
+        spec = plan["sources"][0]["sheets"][0]
+        self.assertEqual(spec["action"], "needs_mapping")
+        table = spec["tables"][0]
+        self.assertNotIn("bidder_name", table["columns"])
+        self.assertEqual(next(item for item in table["column_dispositions"] if item["column"] == "B")["disposition"],
+                         "unrecognized")
+        with self.assertRaisesRegex(LedgerError, "结构审阅"):
+            self.build(b, plan)
+        table["columns"]["bidder_name"] = "B"
+        table["column_dispositions"] = [item for item in table["column_dispositions"] if item["column"] != "B"]
+        table["structure_warnings"] = []
+        spec["action"] = "parse"
+        final, review, _ = self.build(b, plan)
+        self.assertEqual([(row["公司名称"], row["中标与否"]) for row in final], [("甲公司", "是")])
+        self.assertFalse(review)
+
+    def test_unmerged_project_value_at_block_start_is_inherited(self):
+        b, plan = self.book([["项目名称", "投标单位名称", "中标单位"],
+                             ["项目甲", "甲公司", "甲公司"], [None, "乙公司", None]])
+        table = plan["sources"][0]["sheets"][0]["tables"][0]
+        self.assertEqual(table["project_mode"], "blocks")
+        final, _, ledger = self.build(b, plan)
+        self.assertEqual([row["项目名称"] for row in final], ["项目甲", "项目甲"])
+        self.assertEqual(ledger["summary"]["project_count"], 1)
+
+    def test_repeated_bidder_count_is_not_used_as_group_anchor(self):
+        b, plan = self.book([["项目名称", "投标单位名称", "投标单位数量", "中标单位"],
+                             ["项目甲", "甲公司", 3, "甲公司"], ["项目甲", "乙公司", 3, None],
+                             ["项目甲", "丙公司", 3, None]])
+        table = plan["sources"][0]["sheets"][0]["tables"][0]
+        self.assertEqual(table["group_mode"], "project")
+        final, review, ledger = self.build(b, plan)
+        self.assertEqual(ledger["summary"]["group_count"], 1)
+        self.assertEqual([row["中标与否"] for row in final], ["是", "否", "否"])
+        self.assertFalse(review)
+
+    def test_group_context_separates_same_project_lot_across_batches(self):
+        b, plan = self.book([["项目名称", "批次", "标段", "投标单位名称", "中标单位"],
+                             ["项目甲", "第一批", "一标", "甲公司", "甲公司"],
+                             ["项目甲", "第二批", "一标", "甲公司", "甲公司"]])
+        spec = plan["sources"][0]["sheets"][0]
+        self.assertEqual(spec["action"], "needs_mapping")
+        table = spec["tables"][0]
+        item = next(item for item in table["column_dispositions"] if item["column"] == "B")
+        item.update({"disposition": "group_context", "mode": "repeated", "reason": "批次构成独立招标组边界"})
+        table["structure_warnings"] = []
+        spec["action"] = "parse"
+        final, review, ledger = self.build(b, plan)
+        self.assertEqual(len(final), 2)
+        self.assertEqual(ledger["summary"]["group_count"], 2)
+        self.assertEqual([row["中标与否"] for row in final], ["是", "是"])
+        self.assertFalse(review)
+
+    def test_sparse_complete_award_column_can_mark_non_winners(self):
+        b, plan = self.book([["项目名称", "投标单位名称", "中标单位"],
+                             ["项目甲", "甲公司", "甲公司"], ["项目甲", "乙公司", None]])
+        final, review, ledger = self.build(b, plan)
+        self.assertEqual([row["中标与否"] for row in final], ["是", "否"])
+        self.assertTrue(ledger["groups"][0]["award_completeness"]["verified"])
+        self.assertFalse(review)
+
+    def test_late_header_is_found_before_execution(self):
+        rows = [["项目名称", "投标单位名称", "中标单位"]]
+        rows.extend([["项目甲", f"企业{index}公司", None] for index in range(12)])
+        rows.extend([["项目名称", "投标单位名称", "中标单位"], ["项目乙", "乙公司", "乙公司"]])
+        b, plan = self.book(rows)
+        spec = plan["sources"][0]["sheets"][0]
+        self.assertEqual(spec["action"], "needs_mapping")
+        warnings = spec["tables"][0]["structure_warnings"]
+        self.assertIn(14, [warning.get("row") for warning in warnings if warning["code"] == "NEW_HEADER"])
+
+    def test_merged_award_status_does_not_spread_to_multiple_bidders(self):
+        b, plan = self.book([["项目名称", "投标单位名称", "是否中标"],
+                             ["项目甲", "甲公司", "是"], ["项目甲", "乙公司", None]], ("C2:C3",))
+        final, review, ledger = self.build(b, plan)
+        self.assertEqual([row["中标与否"] for row in final], ["", ""])
+        self.assertEqual([issue["code"] for issue in ledger["issues"]], ["AWARD_STATUS_SCOPE_AMBIGUOUS"])
+        self.assertEqual(len(review), 2)
+
+    def test_duplicate_nonempty_fields_merge_independently_of_row_order(self):
+        results = []
+        for detail_rows in (
+            [["项目甲", "甲公司", None, None], ["项目甲", "甲公司", "是", 1]],
+            [["项目甲", "甲公司", "是", 1], ["项目甲", "甲公司", None, None]],
+        ):
+            b, plan = self.book([["项目名称", "投标单位名称", "是否中标", "排名"], *detail_rows])
+            final, review, ledger = self.build(b, plan)
+            results.append((final[0]["中标与否"], final[0]["投标排名"], len(review), ledger["summary"]["issue_count"]))
+        self.assertEqual(results, [("是", "1", 0, 0), ("是", "1", 0, 0)])
+
+    def test_multiple_unavailable_fields_on_one_row_keep_distinct_issues(self):
+        b, plan = self.book([["项目名称", "投标单位名称", "中标单位"], ["项目甲", "=A2", "=A2"]])
+        _, _, ledger = self.build(b, plan)
+        field_issues = [issue for issue in ledger["issues"] if issue["code"] == "FIELD_UNAVAILABLE"]
+        self.assertEqual({issue["field"] for issue in field_issues}, {"bidder_name", "award_name"})
+        self.assertEqual(len({issue["id"] for issue in field_issues}), 2)
+
+    def test_review_region_delivers_other_rows_without_fake_record(self):
+        b, plan = self.book([["项目名称", "投标单位名称"], ["项目甲", "甲公司"], ["项目乙", "乙公司"]])
+        spec = plan["sources"][0]["sheets"][0]
+        spec["tables"][0]["data_end_row"] = 2
+        spec["review_regions"] = [{"start": 3, "end": 3, "reason": "局部结构仍无法确认"}]
+        final, review, ledger = self.build(b, plan)
+        self.assertEqual([row["公司名称"] for row in final], ["甲公司"])
+        self.assertEqual(len(review), 1)
+        self.assertEqual(review[0]["公司名称"], "")
+        self.assertEqual(ledger["summary"]["record_count"], 1)
+        self.assertEqual(ledger["summary"]["unique_company_count"], 1)
+
+    def test_multifile_unreadable_source_keeps_valid_delivery(self):
+        b, _ = self.book([["项目名称", "投标单位名称"], ["项目甲", "甲公司"]])
+        bad = self.directory / "broken.xlsx"
+        bad.write_bytes(b"not-ooxml")
+        output = self.directory / "mixed-output"
+        first = subprocess.run([sys.executable, "-B", str(ROOT / "scripts" / "excel_ledger.py"), "run",
+                                str(b.path), str(bad), "--output", str(output)], capture_output=True, text=True)
+        self.assertEqual(first.returncode, 3, first.stderr)
+        inspection = json.loads(first.stdout)["inspection"]
+        self.assertEqual(len(inspection["source_failures"]), 1)
+        plan_path = self.directory / "mixed-plan.json"
+        plan_path.write_text(json.dumps(inspection["suggested_plan"], ensure_ascii=False), encoding="utf-8")
+        second = subprocess.run([sys.executable, "-B", str(ROOT / "scripts" / "excel_ledger.py"), "run",
+                                 str(b.path), str(bad), "--plan", str(plan_path), "--output", str(output)],
+                                capture_output=True, text=True)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        ledger = json.loads((output / "ledger.json").read_text(encoding="utf-8"))
+        self.assertEqual(ledger["summary"]["record_count"], 1)
+        self.assertEqual(ledger["summary"]["unique_company_count"], 1)
+        self.assertIn("SOURCE_UNREADABLE", [issue["code"] for issue in ledger["issues"]])
+        with (output / "review_queue.csv").open(encoding="utf-8-sig", newline="") as stream:
+            review = list(csv.DictReader(stream))
+        self.assertEqual(len(review), 1)
+        self.assertEqual(review[0]["公司名称"], "")
+
+    def test_confidence_is_rule_based_and_audited(self):
+        b, plan = self.book([["项目名称", "投标单位名称"], ["项目甲", "甲公司"]])
+        final, _, ledger = self.build(b, plan)
+        self.assertNotEqual(final[0]["置信度"], "1.0")
+        self.assertEqual(float(final[0]["置信度"]), ledger["records"][0]["confidence"]["score"])
+        self.assertEqual(ledger["records"][0]["confidence"]["meaning"], "rule_reliability_not_probability")
 
 
 if __name__ == "__main__":

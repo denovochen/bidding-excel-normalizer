@@ -36,7 +36,10 @@ class DeterministicMatchingTests(unittest.TestCase):
         workbook.save(path); workbook.close()
         book = read_workbook(path)
         plan = inspect_workbooks([book])["suggested_plan"]
-        plan["sources"][0]["sheets"][0]["tables"][0]["award_mode"] = mode
+        table = plan["sources"][0]["sheets"][0]["tables"][0]
+        table["award_mode"] = mode
+        table["award_completeness"] = {"status": "complete", "basis_type": "structural",
+                                       "basis": "测试夹具声明为完整最终结果区域"}
         return book, plan
 
     def run_case(self, rows, merges=(), mode="auto"):
@@ -61,12 +64,12 @@ class DeterministicMatchingTests(unittest.TestCase):
         f, r, l = self.run_case([["项目名称", "投标单位名称", "投标报价", "投标单位法人", "中标单位", "中标单位法人", "中标金额"],
                                  ["项目甲", "海岳水利市政工程有限公司", 120, "张甲", "海岳建设有限公司", "李乙", 120],
                                  ["项目甲", "远洋建设有限公司", 121, "王丙", None]])
-        self.assertEqual([x["中标与否"] for x in f], ["是", "否"])
+        self.assertEqual([x["中标与否"] for x in f], ["", ""])
         self.assertEqual(f[0]["公司名称"], "海岳水利市政工程有限公司")
-        self.assertEqual(l["groups"][0]["award_matching"]["mode"], "row_aligned")
-        self.assertEqual(l["groups"][0]["award_matches"][0]["basis"], "row_alignment")
+        self.assertEqual(l["groups"][0]["award_matching"]["mode"], "group_match")
+        self.assertEqual(l["groups"][0]["award_matches"][0]["status"], "unresolved")
         self.assertEqual(l["records"][0]["corrections"], [])
-        self.assertFalse(r)
+        self.assertEqual(len(r), 2)
 
     def test_sparse_nonempty_cell_alone_is_not_a_row_relationship(self):
         f, r, l = self.run_case([["项目名称", "投标单位名称", "中标单位"],
@@ -145,6 +148,33 @@ class DeterministicMatchingTests(unittest.TestCase):
         self.assertEqual([x["中标与否"] for x in f], ["是", "否"])
         self.assertFalse(r)
 
+    def test_single_sided_amount_unit_and_same_person_do_not_auto_match(self):
+        f, r, ledger = self.run_case([
+            ["项目名称", "投标单位名称", "投标报价", "投标单位法人", "中标单位", "中标单位法人", "中标价(万元)"],
+            ["项目甲", "甲公司", 10, "张甲", "旧名称", "张甲", 10],
+            ["项目甲", "乙公司", 12, "李乙", None, None, None],
+        ], mode="name_match")
+        self.assertEqual([row["中标与否"] for row in f], ["", ""])
+        self.assertEqual(len(r), 2)
+        candidate = ledger["groups"][0]["award_matches"][0]["candidates"][0]
+        self.assertTrue(candidate["person_amount_equal"])
+        self.assertTrue(candidate["amount_unit_assumed"])
+        self.assertFalse(candidate["person_amount_confirming"])
+
+    def test_same_person_alone_does_not_confirm_and_different_person_does_not_deny_exact_name(self):
+        f, r, _ = self.run_case([
+            ["项目名称", "投标单位名称", "投标单位法人", "中标单位", "中标单位法人"],
+            ["项目甲", "甲公司", "张甲", "旧名称", "张甲"], ["项目甲", "乙公司", "李乙", None, None],
+        ], mode="name_match")
+        self.assertEqual([row["中标与否"] for row in f], ["", ""])
+        self.assertEqual(len(r), 2)
+        f, r, _ = self.run_case([
+            ["项目名称", "投标单位名称", "投标单位法人", "中标单位", "中标单位法人"],
+            ["项目甲", "甲公司", "张甲", "甲公司", "李乙"], ["项目甲", "乙公司", "王丙", None, None],
+        ], mode="name_match")
+        self.assertEqual([row["中标与否"] for row in f], ["是", "否"])
+        self.assertFalse(r)
+
     def test_placeholder_in_award_field_does_not_make_a_winner(self):
         f, r, _ = self.run_case([["项目名称", "投标单位名称", "中标单位"], ["项目甲", "甲公司", "未中标"], ["项目甲", "乙公司", None]], mode="row_aligned")
         self.assertEqual([x["中标与否"] for x in f], ["", ""])
@@ -166,8 +196,9 @@ class DeterministicMatchingTests(unittest.TestCase):
         f, r, l = self.run_case([["项目名称", "投标企业名单", "中标单位"],
                                  ["项目甲", "海岳建设工程有限公司、北方远洋建筑工程有限公司", "北方海岳建设工程有限公司"]])
         self.assertEqual(f[0]["公司名称"], "海岳建设工程有限公司")
-        self.assertEqual([x["中标与否"] for x in f], ["是", "否"])
-        self.assertFalse(r)
+        self.assertEqual([x["中标与否"] for x in f], ["", ""])
+        self.assertEqual(len(r), 2)
+        self.assertEqual(l["groups"][0]["award_matches"][0]["status"], "unresolved")
 
     def test_ambiguous_abbreviations_keep_review(self):
         f, r, _ = self.run_case([["项目名称", "投标企业名单", "中标单位"],
@@ -201,10 +232,17 @@ class DeterministicMatchingTests(unittest.TestCase):
         with self.assertRaises(LedgerError):
             publish(self.root / "bad-group", f, r, altered)
 
-    def test_cli_finishes_unresolved_names_in_one_run_without_decision_files(self):
+    def test_cli_reviews_structure_then_finishes_without_name_decision_files(self):
         book, _ = self.prepare([["项目名称", "投标企业名单", "中标单位"], ["项目甲", "甲公司、乙公司", "丙公司"]])
         out = self.root / "output"
-        result = subprocess.run([sys.executable, "-B", str(ROOT / "scripts" / "excel_ledger.py"), "run", str(book.path), "--output", str(out)], text=True, capture_output=True)
+        first = subprocess.run([sys.executable, "-B", str(ROOT / "scripts" / "excel_ledger.py"), "run",
+                                str(book.path), "--output", str(out)], text=True, capture_output=True)
+        self.assertEqual(first.returncode, 3)
+        plan = json.loads(first.stdout)["inspection"]["suggested_plan"]
+        plan_path = self.root / "plan.json"
+        plan_path.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-B", str(ROOT / "scripts" / "excel_ledger.py"), "run",
+                                 str(book.path), "--plan", str(plan_path), "--output", str(out)], text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         reply = json.loads(result.stdout)
         self.assertEqual(reply["kind"], "result")
