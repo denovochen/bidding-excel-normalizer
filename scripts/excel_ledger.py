@@ -12,6 +12,8 @@ from pathlib import Path
 from ledger_core.artifacts import publish, validate_outputs
 from ledger_core.contract import LedgerError, MappingRevisionRequired, RecoverableWorkbookError
 from ledger_core.normalize import build_outputs
+from ledger_core.review import (apply_answers, cleanup_state, create_state, load_answers, load_state,
+                                pending_questions, review_result, save_state)
 from ledger_core.workbook import describe_source_failure, inspect_workbooks, load_json, read_workbook
 
 
@@ -39,6 +41,10 @@ def main(argv: list[str] | None = None) -> int:
     validate.add_argument("output", type=Path)
     companies = commands.add_parser("companies", help="只读输出全批次去重企业名单 JSON，供后续 Gateway 采集编排使用")
     companies.add_argument("output", type=Path)
+    resolve = commands.add_parser("resolve", help="接受内置提问工具返回的中标企业选择并继续复核或发布")
+    resolve.add_argument("--state", type=Path, required=True)
+    resolve.add_argument("--answers", type=Path, required=True)
+    resolve.add_argument("--progress", action="store_true", help="输出恢复、重建和发布阶段日志")
     args = parser.parse_args(argv)
     active_step = 0
 
@@ -58,6 +64,36 @@ def main(argv: list[str] | None = None) -> int:
                 ledger = json.loads((args.output / "ledger.json").read_text(encoding="utf-8"))
                 result = {"kind": "companies", "companies": ledger["unique_companies"],
                           "company_count": len(ledger["unique_companies"])}
+        elif args.command == "resolve":
+            state = load_state(args.state)
+            state_path = Path(state["state_path"])
+            progress(1, "in_progress")
+            books, source_failures = [], []
+            for input_path in [Path(value) for value in state["inputs"]]:
+                try:
+                    books.append(read_workbook(input_path))
+                except RecoverableWorkbookError as exc:
+                    source_failures.append(describe_source_failure(input_path, str(exc)))
+            progress(1, "completed")
+            progress(2, "in_progress")
+            prepared = build_outputs(books, state["plan"], generated_at=state["generated_at"],
+                                     source_failures=source_failures, award_resolutions=state["decisions"])
+            errors = apply_answers(state, prepared[2], load_answers(args.answers))
+            save_state(state_path, state)
+            prepared = build_outputs(books, state["plan"], generated_at=state["generated_at"],
+                                     source_failures=source_failures, award_resolutions=state["decisions"])
+            questions, _, remaining = pending_questions(prepared[2], state["decisions"])
+            progress(2, "completed")
+            if remaining:
+                result = review_result(state_path, prepared[2], state, errors)
+            else:
+                progress(3, "in_progress")
+                result = publish(Path(state["output"]), *prepared)
+                try:
+                    cleanup_state(state_path)
+                except OSError:
+                    pass
+                progress(3, "completed")
         else:
             progress(1, "in_progress")
             books, source_failures = [], []
@@ -94,12 +130,18 @@ def main(argv: list[str] | None = None) -> int:
                         return 3
                 prepared = build_outputs(books, plan, source_failures=source_failures)
                 progress(2, "completed")
-                progress(3, "in_progress")
                 output = args.output or Path.cwd() / "outputs" / ("excel-ledger-" + uuid.uuid4().hex)
-                result = publish(output, *prepared)
-                progress(3, "completed")
+                questions, review_task_count, remaining = pending_questions(prepared[2], {})
+                if remaining:
+                    state_path = create_state(args.inputs, plan, output, prepared[2]["generated_at"], review_task_count)
+                    state = load_state(state_path)
+                    result = review_result(state_path, prepared[2], state)
+                else:
+                    progress(3, "in_progress")
+                    result = publish(output, *prepared)
+                    progress(3, "completed")
         print(json.dumps(result, ensure_ascii=False, allow_nan=False), flush=True)
-        return 0
+        return 4 if result["kind"] == "award_review_required" else 0
     except MappingRevisionRequired as exc:
         print(json.dumps({"kind": "mapping_required", "message": str(exc), "evidence": exc.evidence},
                          ensure_ascii=False), flush=True)

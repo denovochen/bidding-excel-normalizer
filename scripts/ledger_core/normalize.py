@@ -399,7 +399,7 @@ def _canonical_award_status(value: object) -> str | None:
     return AWARD_STATUS_VALUES.get(raw.casefold())
 
 
-def finish_group(group: dict[str, Any], issues: list[dict[str, Any]]) -> None:
+def finish_group(group: dict[str, Any], issues: list[dict[str, Any]], resolutions: dict[str, dict]) -> None:
     signals = set(group["procurement_signals"])
     uncertain = "uncertain" in signals or {"not_non_tender", "non_tender"}.issubset(signals)
     group["procurement_status"] = "uncertain" if uncertain else "non_tender" if "non_tender" in signals else (
@@ -450,7 +450,7 @@ def finish_group(group: dict[str, Any], issues: list[dict[str, Any]]) -> None:
     if len(counts) > 1 or (counts and counts != {actual_count}):
         issues.append(_issue("BIDDER_COUNT_MISMATCH", "声明投标数量与整理后的企业数量不一致", group,
                              declared_counts=sorted(counts), actual_count=actual_count))
-    matched, unresolved = match_group(group)
+    matched, unresolved = match_group(group, resolutions)
     for problem in unresolved:
         details = dict(problem)
         issues.append(_issue(details.pop("code"), details.pop("message"), group, **details))
@@ -523,8 +523,7 @@ def _record_confidence(record: dict[str, Any], group: dict[str, Any], related: l
     selected = next((match for match in group["award_matches"]
                      if match["selected_record_id"] == record["id"]), None)
     if selected:
-        award = {"exact_name": 1.0, "unique_person_amount": 0.90,
-                 "row_alignment": 0.85}.get(selected["basis"], 0.75)
+        award = {"exact_name": 1.0, "user_selection": 1.0}.get(selected["basis"], 0.75)
         award_basis = selected["basis"]
     elif record["award_status"] == "否":
         basis_type = group["award_completeness"].get("basis_type")
@@ -547,7 +546,8 @@ def _record_confidence(record: dict[str, Any], group: dict[str, Any], related: l
 
 def build_outputs(books: list[Workbook], plan: dict[str, Any], alias_payload: dict[str, Any] | None = None,
                   generated_at: str | None = None,
-                  source_failures: list[dict[str, Any]] | None = None) -> tuple[list[dict], list[dict], dict]:
+                  source_failures: list[dict[str, Any]] | None = None,
+                  award_resolutions: dict[str, dict] | None = None) -> tuple[list[dict], list[dict], dict]:
     validate_plan(plan, books)
     alias_payload = alias_payload or {"schema_version": 1, "aliases": []}
     if aliases_from_json(alias_payload):
@@ -560,6 +560,7 @@ def build_outputs(books: list[Workbook], plan: dict[str, Any], alias_payload: di
     except ValueError as exc:
         raise LedgerError("生成时间必须为带时区的 ISO 8601") from exc
     source_failures = source_failures or []
+    award_resolutions = award_resolutions or {}
     projects, groups, issues, row_audit, skipped = [], [], [], [], []
     for failure in source_failures:
         issues.append(_issue("SOURCE_UNREADABLE", failure["error"], None, standalone=True,
@@ -592,7 +593,7 @@ def build_outputs(books: list[Workbook], plan: dict[str, Any], alias_payload: di
                                      reason=region["reason"]))
     projects = list({p["id"]: p for p in projects}.values())
     for group in groups:
-        finish_group(group, issues)
+        finish_group(group, issues, award_resolutions)
     project_by_id = {p["id"]: p for p in projects}
     book_by_id = {b.source_id: b for b in books}
     # 分组问题对应整个组，避免只标候选而把其他企业误写成已确认未中标。
@@ -697,6 +698,8 @@ def build_outputs(books: list[Workbook], plan: dict[str, Any], alias_payload: di
                       "format": b.format, "sheets": [s.name for s in b.sheets], "status": "parsed"} for b in books] +
                     [dict(failure) for failure in source_failures]),
         "mapping": plan, "matching_policy": dict(POLICY),
+        "resolutions": [dict({"review_task_id": task_id}, **resolution)
+                        for task_id, resolution in sorted(award_resolutions.items())],
         "summary": {
             "project_count": len(projects), "explicit_lot_count": sum(bool(g["lot_name"] or g["lot_code"]) for g in groups),
             "group_count": len(groups), "bidding_group_count": sum(g["procurement_status"] == "bidding" for g in groups),
@@ -713,7 +716,7 @@ def build_outputs(books: list[Workbook], plan: dict[str, Any], alias_payload: di
         "records": audit_records, "issues": issues, "row_audit": row_audit, "skipped_sheets": skipped,
         "unique_companies": list(unique.values()),
         "notes": ["置信度是由提取、分组和中标对应规则计算的可靠程度，不是正确概率；逐条组成和依据保存在 records.confidence。",
-                  "名称相似度只用于候选排序，不单独确认中标对应；单侧金额单位沿用只作审计证据。",
+                  "非精确中标名称只生成推荐候选，必须由用户选择或保持不确定；法人和金额仅作来源审计。",
                   "存在投标列时公司名称仅来自投标列；中标名和对应依据保留在 groups.award_matches，不回写或纠正投标全称。",
                   "unique_companies 按 Gitee 客户端的 NFKC、去空白、casefold 规则从 final 非空公司名称去重；包括待复核名称，可供后续采集编排读取。",
                   "业务字段缺失仅留空，不伪造项目/标段归属，也不因缺少中标字段要求用户补充。",

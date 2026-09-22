@@ -59,8 +59,8 @@
 
 投标数量每行重复时不能作为 anchor。相同项目和标段存在不同批次、轮次或独立块时，优先把对应列设为 group_context；也可拆为多个 table。组 ID 包含区域边界，Python 只在组内匹配和去重。
 
-`bidder_separator` 可为 single、delimited 或 lines。名单顺序不是排名；联合体无法确认成员关系时进入复核。`award_mode=auto` 由脚本检查结构和组内证据；`name_match` 明确采用组内名单；`row_aligned` 只用于已确认的逐行对应区域，仍执行合并、名单、重复和跨行冲突检查。
+`bidder_separator` 可为 single、delimited 或 lines。名单顺序不是排名；联合体无法确认成员关系时进入复核。`award_mode=auto` 检查是否可安全把同行企业作为人工确认推荐项；`name_match` 明确只按组内名称推荐；`row_aligned` 表示区域已确认逐行对应，但非精确名称仍需用户选择。三种模式都只自动确认精确名称，并执行合并、名单、重复和跨行冲突检查。
 
 `award_completeness.status` 为 complete、partial 或 unknown；`basis_type` 为 explicit、structural 或 none，basis 必须写区域级依据。不能仅因存在中标列就设 complete，也不能因中标单元格稀疏就设 partial。Python 会逐组核验边界、读取覆盖和名称对应；只有 complete 且核验通过的组才把未匹配企业标“否”。
 
-缺失业务值留空，不补造编号、排名或结果。中标对应由脚本完成，输出保留投标名称；plan 中不写公司别名或逐对名称决定。需要补证据时使用 `inspect --sheet <名称> --rows <起始:结束>`，一次最多100行，不读取完整 ledger 或全部企业名单。
+缺失业务值留空，不补造编号、排名或结果。输出保留投标名称；plan 中不写公司别名或逐对名称决定。非精确中标名称在执行阶段按 [中标企业人工确认](award-review.md) 处理。需要补证据时使用 `inspect --sheet <名称> --rows <起始:结束>`，一次最多100行，不读取完整 ledger 或全部企业名单。

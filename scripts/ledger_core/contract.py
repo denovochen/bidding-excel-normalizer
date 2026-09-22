@@ -7,7 +7,7 @@ import re
 import unicodedata
 from datetime import datetime
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 FIELDS = [
     "序号", "项目名称", "项目编号", "标段名称", "标段编号", "公司名称", "中标与否", "投标排名",
     "文件类别", "依据文件路径", "来源页码", "提取方式", "证据文本", "置信度", "复核状态", "解析结果生成日期时间",

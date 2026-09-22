@@ -1,26 +1,22 @@
-"""按结构和组内证据对应投标记录；不纠正企业全称。 @author denovochen"""
+"""按组内名称和结构生成确定性对应及人工复核候选。 @author denovochen"""
 from __future__ import annotations
 
 import re
 from collections import Counter
-from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 
-from .contract import clean, name_key
+from .contract import clean, name_key, stable_id
 
-# 通用组织/行业词仅在比较时降权，绝不据此改写输出名称或删除参与记录。
 COMMON_WORDS = re.compile(r"有限责任|股份|有限|公司|集团|建设|建筑|工程|水利|市政|节水|器材")
-POLICY = {"version": 2, "company_name": "bidder_preferred", "method": "deterministic",
-          "min_full_similarity": 0.80, "min_core_similarity": 0.75,
-          "min_score": 0.85, "min_margin": 0.10, "core_weight": 0.65,
-          "min_abbreviation_full": 0.90, "min_abbreviation_margin": 0.15,
-          "name_similarity_usage": "candidate_order_only",
-          "single_sided_amount_unit": "review_only"}
-
-
-def person_key(value: str) -> str:
-    key = name_key(value)
-    return "" if key in {"", "/", "-", "—", "无", "暂无", "不详", "未知", "未提供", "待定"} else key
+POLICY = {
+    "version": 3,
+    "company_name": "bidder_preferred",
+    "method": "deterministic_with_user_resolution",
+    "automatic_match": "exact_name_only",
+    "recommendation": "safe_same_row_then_name_similarity",
+    "core_weight": 0.65,
+    "auxiliary_fields": "audit_only",
+}
 
 
 def similarities(a: str, b: str) -> tuple[float, float, float]:
@@ -31,157 +27,151 @@ def similarities(a: str, b: str) -> tuple[float, float, float]:
     return full, core, POLICY["core_weight"] * core + (1 - POLICY["core_weight"]) * full
 
 
-def amount(value: str, unit: str = "") -> Decimal | None:
-    raw = clean(value).replace(",", "")
-    match = re.fullmatch(r"([+-]?\d+(?:\.\d+)?)\s*(亿元|万元|元)?", raw)
-    if not match:
-        return None
-    try:
-        result = Decimal(match[1]) * {"": 1, "元": 1, "万元": 10000, "亿元": 100000000}[match[2] or unit]
-        return result if result.is_finite() and result > 0 else None
-    except (InvalidOperation, KeyError):
-        return None
-
-
-def _declared_unit(value: str, header_unit: str) -> str:
-    raw = clean(value).replace(",", "")
-    match = re.fullmatch(r"([+-]?\d+(?:\.\d+)?)\s*(亿元|万元|元)?", raw)
-    return (match[2] if match else "") or header_unit
-
-
-def candidate_scores(award: dict, records: list[dict], units: dict) -> list[dict]:
-    bidder_header_unit = units.get("bidder_price", "")
-    award_header_unit = units.get("award_price", "")
-    award_declared_unit = _declared_unit(award["price"], award_header_unit)
+def candidate_scores(award: dict, records: list[dict]) -> list[dict]:
     candidates = []
     for record in records:
         if not record["name"]:
             continue
         full, core, score = similarities(award["name"], record["name"])
-        stems = sorted((COMMON_WORDS.sub("", name_key(award["name"])), COMMON_WORDS.sub("", name_key(record["name"]))), key=len)
-        prefix_omitted = 2 <= len(stems[0]) < len(stems[1]) and stems[1].endswith(stems[0])
-        evidence = []
-        for occurrence in record["occurrences"]:
-            values = occurrence["values"]
-            person = bool(person_key(award["legal_person"]) and
-                          person_key(award["legal_person"]) == person_key(values.get("bidder_legal_person", "")))
-            bidder_value = values.get("bidder_price", "")
-            bidder_declared_unit = _declared_unit(bidder_value, bidder_header_unit)
-            award_amount = amount(award["price"], award_declared_unit or bidder_declared_unit)
-            bidder_amount = amount(bidder_value, bidder_declared_unit or award_declared_unit)
-            price = award_amount is not None and award_amount == bidder_amount
-            unit_assumed = price and bool(award_declared_unit) != bool(bidder_declared_unit)
-            evidence.append((person, price, unit_assumed))
-        candidates.append({"record_id": record["id"], "name": record["name"],
-                           "name_similarity": round(full, 6), "core_similarity": round(core, 6),
-                           "score": round(score, 6), "same_row": any(o["row"] == award["row"] for o in record["occurrences"]),
-                           "prefix_omitted": prefix_omitted,
-                           "legal_person_equal": any(e[0] for e in evidence) if award["single_name"] else False,
-                           "amount_equal": any(e[1] for e in evidence) if award["single_name"] else False,
-                           "amount_unit_assumed": any(e[1] and e[2] for e in evidence) if award["single_name"] else False,
-                           "person_amount_equal": any(e[0] and e[1] for e in evidence) if award["single_name"] else False,
-                           "person_amount_confirming": any(e[0] and e[1] and not e[2] for e in evidence)
-                           if award["single_name"] else False})
-    return sorted(candidates, key=lambda c: (-c["score"], c["record_id"]))
+        candidates.append({
+            "record_id": record["id"],
+            "name": record["name"],
+            "name_similarity": round(full, 6),
+            "core_similarity": round(core, 6),
+            "score": round(score, 6),
+            "same_row": any(occurrence["row"] == award["row"] for occurrence in record["occurrences"]),
+        })
+    return sorted(candidates, key=lambda candidate: (-candidate["score"], candidate["record_id"]))
 
 
-def _row_mode(group: dict, cases: list[dict]) -> dict:
-    fallback = {"mode": "group_match", "reason": "按组内中标名单对应"}
+def _row_recommendation(group: dict, cases: list[dict]) -> dict:
+    fallback = {"safe": False, "reason": "按组内名称接近程度推荐"}
     if group["award_mode"] == "name_match" or group["company_role"] != "bidder_name" or not cases:
         return fallback
-    rows = Counter(o["row"] for r in group["records"] for o in r["occurrences"])
-    if any(n != 1 for n in rows.values()) or any(not o["single_bidder_row"] for r in group["records"] for o in r["occurrences"]):
-        return {"mode": "group_match", "reason": "投标单元格为名单或跨行合并"}
+    rows = Counter(occurrence["row"] for record in group["records"] for occurrence in record["occurrences"])
+    if any(count != 1 for count in rows.values()) or any(
+        not occurrence["single_bidder_row"]
+        for record in group["records"]
+        for occurrence in record["occurrences"]
+    ):
+        return {"safe": False, "reason": "投标字段为名单或跨行合并，不能按同行推荐"}
     awards = group["awards"]
-    award_rows = [a["row"] for a in awards]
-    if (any(a["merged"] or not a["single_name"] for a in awards) or len(set(award_rows)) != len(award_rows) or
-            len({name_key(a["name"]) for a in awards}) != len(awards)):
-        return {"mode": "group_match", "reason": "中标字段合并、列多家或重复展示"}
-    if set(award_rows) >= set(rows):
-        return {"mode": "group_match", "reason": "全部投标行均有中标字段，逐名匹配"}
+    award_rows = [award["row"] for award in awards]
+    if (any(award["merged"] or not award["single_name"] for award in awards) or
+            len(set(award_rows)) != len(award_rows) or
+            len({name_key(award["name"]) for award in awards}) != len(awards)):
+        return {"safe": False, "reason": "中标字段合并、含多家或重复展示，不能按同行推荐"}
+    if set(award_rows) >= set(rows) and group["award_mode"] != "row_aligned":
+        return {"safe": False, "reason": "全部投标行均有中标字段，按组内名称推荐"}
     for case in cases:
-        same = [c for c in case["candidates"] if c["same_row"]]
-        if len(same) != 1 or any(c["record_id"] != same[0]["record_id"] for c in case["exact"]):
-            return {"mode": "group_match", "reason": "中标名称对应其他行或同行不是单家企业"}
-        own = same[0]
-        if any(c["record_id"] != own["record_id"] for c in case["joint"]):
-            return {"mode": "group_match", "reason": "法人和金额证据指向其他行"}
-        supported = bool(case["exact"]) or own["person_amount_confirming"]
-        if not supported and group["award_mode"] != "row_aligned":
-            return {"mode": "group_match", "reason": "同行关系缺少独立支持，不能仅凭非空推断"}
-    return {"mode": "row_aligned", "reason": "单企业行与单家中标信息对应，且无跨行匹配冲突",
-            "declared": group["award_mode"] == "row_aligned"}
+        same_row = [candidate for candidate in case["candidates"] if candidate["same_row"]]
+        if len(same_row) != 1:
+            return {"safe": False, "reason": "中标行未唯一对应一家投标企业"}
+        if any(candidate["record_id"] != same_row[0]["record_id"] for candidate in case["exact"]):
+            return {"safe": False, "reason": "中标名称精确对应组内其他行，不能按同行推荐"}
+    return {"safe": True, "reason": "中标信息与推荐投标企业位于同一行"}
 
 
-def match_group(group: dict) -> tuple[set[str], list[dict]]:
+def _task_id(group: dict, award: dict, entries: list[dict]) -> str:
+    return stable_id(
+        "award_review",
+        group["id"],
+        name_key(award["name"]),
+        sorted({entry["cell"] for entry in entries}),
+    )
+
+
+def match_group(group: dict, resolutions: dict[str, dict] | None = None) -> tuple[set[str], list[dict]]:
+    resolutions = resolutions or {}
     awards = {}
     for award in group["awards"]:
         awards.setdefault(name_key(award["name"]), []).append(award)
     cases = []
     for entries in awards.values():
         award = entries[0]
-        candidates = candidate_scores(award, group["records"], group["price_units"])
-        cases.append({"award": award, "entries": entries, "candidates": candidates,
-                      "exact": [c for c in candidates if name_key(c["name"]) == name_key(award["name"])],
-                      "joint": [c for c in candidates if c["person_amount_confirming"]]})
-    group["award_matching"] = _row_mode(group, cases)
+        candidates = candidate_scores(award, group["records"])
+        cases.append({
+            "award": award,
+            "entries": entries,
+            "candidates": candidates,
+            "exact": [candidate for candidate in candidates if name_key(candidate["name"]) == name_key(award["name"])],
+            "review_task_id": _task_id(group, award, entries),
+        })
+    row_recommendation = _row_recommendation(group, cases)
+    group["award_matching"] = {
+        "mode": "group_match",
+        "reason": "精确名称自动对应；非精确名称由用户确认",
+        "row_recommendation": row_recommendation,
+    }
     for case in cases:
-        candidates, exact, joint = case["candidates"], case["exact"], case["joint"]
+        candidates, exact = case["candidates"], case["exact"]
         selected, basis, conflict = None, "unresolved", False
-        # 同名中标信息重复填写时，不能忽略不同的非空辅助信息。
-        people = {person_key(a["legal_person"]) for a in case["entries"]} - {""}
-        unit = group["price_units"].get("award_price") or group["price_units"].get("bidder_price", "")
-        prices = {amount(a["price"], unit) for a in case["entries"]} - {None}
-        conflict = len(people) > 1 or len(prices) > 1
-        if exact:
-            if len(exact) == 1:
-                selected, basis = exact[0], "exact_name"
-                conflict |= any(c["record_id"] != selected["record_id"] for c in joint)
-            else:
-                conflict = True
-        elif group["award_matching"]["mode"] == "row_aligned":
-            selected = next(c for c in candidates if c["same_row"])
-            basis = "row_alignment"
-        elif joint:
-            if len(joint) == 1:
-                selected, basis = joint[0], "unique_person_amount"
-            else:
-                conflict = True
-        # 名称相似度和简称只用于候选排序；没有结构或独立证据时保留复核。
-        plausible = None
-        if not selected and candidates:
-            best = candidates[0]
-            margin = best["score"] - (candidates[1]["score"] if len(candidates) > 1 else 0)
-            if ((best["name_similarity"] >= POLICY["min_full_similarity"] and
-                 best["core_similarity"] >= POLICY["min_core_similarity"] and
-                 best["score"] >= POLICY["min_score"] and margin >= POLICY["min_margin"]) or
-                    (best["prefix_omitted"] and best["name_similarity"] >= POLICY["min_abbreviation_full"] and
-                     margin >= POLICY["min_abbreviation_margin"])):
-                plausible = best["record_id"]
-        case.update(selected=selected, basis=basis, conflict=conflict, plausible_record_id=plausible)
-    targets = Counter(c["selected"]["record_id"] for c in cases if c["selected"])
-    contested = {case["plausible_record_id"] for case in cases
-                 if case["plausible_record_id"] and case["plausible_record_id"] in targets}
+        if len(exact) == 1:
+            selected, basis = exact[0], "exact_name"
+        elif len(exact) > 1:
+            conflict = True
+        else:
+            resolution = resolutions.get(case["review_task_id"])
+            if resolution and resolution.get("decision") == "select_bidder":
+                selected = next(
+                    (candidate for candidate in candidates if candidate["record_id"] == resolution.get("record_id")),
+                    None,
+                )
+                if selected:
+                    basis = "user_selection"
+                else:
+                    conflict = True
+        same_row = [candidate for candidate in candidates if candidate["same_row"]]
+        recommended = same_row[0] if row_recommendation["safe"] and len(same_row) == 1 else (
+            candidates[0] if candidates else None
+        )
+        recommendation_basis = "same_row" if recommended in same_row and row_recommendation["safe"] else "name_similarity"
+        case.update(
+            selected=selected,
+            basis=basis,
+            conflict=conflict,
+            recommended=recommended,
+            recommendation_basis=recommendation_basis,
+        )
+    targets = Counter(case["selected"]["record_id"] for case in cases if case["selected"])
     matched, unresolved, audits = set(), [], []
     for case in cases:
         award, selected = case["award"], case["selected"]
-        conflict = (case["conflict"] or bool(selected and targets[selected["record_id"]] > 1) or
-                    bool(selected and selected["record_id"] in contested) or
-                    bool(not selected and case["plausible_record_id"] in contested))
+        conflict = case["conflict"] or bool(selected and targets[selected["record_id"]] > 1)
         applied = selected is not None and not conflict
         displayed = case["candidates"][:3]
-        if selected and selected not in displayed:
-            displayed = displayed + [selected]
-        audits.append({"original_award": award["raw"], "award_cells": [a["cell"] for a in case["entries"]],
-                       "status": "matched" if applied else "conflict" if conflict else "unresolved",
-                       "basis": case["basis"], "selected_record_id": selected["record_id"] if applied else None,
-                       "selected_bidder_name": selected["name"] if applied else None,
-                       "candidate_count": len(case["candidates"]), "candidates": displayed})
+        for candidate in (selected, case["recommended"]):
+            if candidate and candidate not in displayed:
+                displayed.append(candidate)
+        resolution = resolutions.get(case["review_task_id"])
+        audits.append({
+            "original_award": award["raw"],
+            "award_cells": [entry["cell"] for entry in case["entries"]],
+            "status": "matched" if applied else "conflict" if conflict else "unresolved",
+            "basis": case["basis"],
+            "selected_record_id": selected["record_id"] if applied else None,
+            "selected_bidder_name": selected["name"] if applied else None,
+            "candidate_count": len(case["candidates"]),
+            "candidates": displayed,
+            "review_task_id": case["review_task_id"],
+            "recommended_record_id": case["recommended"]["record_id"] if case["recommended"] else None,
+            "recommended_bidder_name": case["recommended"]["name"] if case["recommended"] else None,
+            "recommendation_basis": case["recommendation_basis"],
+            "recommendation_reason": row_recommendation["reason"] if case["recommendation_basis"] == "same_row" else
+                                     "组内名称最接近",
+            "resolution": resolution if resolution and resolution.get("decision") == "select_bidder" else None,
+        })
         if applied:
             matched.add(selected["record_id"])
         else:
-            unresolved.append({"code": "AWARD_MATCH_CONFLICT" if conflict else "AWARD_NAME_MISMATCH",
-                               "message": "中标对应证据冲突，保留复核" if conflict else "中标信息未能唯一对应本组投标企业，保留复核",
-                               "original_award": award["raw"], "award_cell": award["cell"], "candidates": displayed})
+            unresolved.append({
+                "code": "AWARD_MATCH_CONFLICT" if conflict else "AWARD_NAME_MISMATCH",
+                "message": "中标对应证据冲突，保留复核" if conflict else "中标名称需要用户确认对应的投标企业",
+                "original_award": award["raw"],
+                "award_cell": award["cell"],
+                "candidates": displayed,
+                "review_task_id": case["review_task_id"],
+                "recommended_record_id": case["recommended"]["record_id"] if case["recommended"] else None,
+            })
     group["award_matches"] = audits
     return matched, unresolved

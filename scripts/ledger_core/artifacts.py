@@ -265,8 +265,26 @@ def _validate_award_matches(ledger: dict) -> None:
                         match["selected_bidder_name"] != record["company_name"] or
                         chosen not in {c["record_id"] for c in match["candidates"]} or
                         (ledger.get("parser_version") == VERSION and
-                         match["basis"] not in {"exact_name", "unique_person_amount", "row_alignment"})):
+                         match["basis"] not in {"exact_name", "user_selection"})):
                     raise LedgerError("中标对应重复、跨组或名称不一致")
                 selected_ids.add(chosen)
             elif chosen is not None or match["selected_bidder_name"] is not None:
                 raise LedgerError("未解决的中标信息不得指定企业")
+    if ledger.get("parser_version") == VERSION:
+        resolutions = ledger.get("resolutions")
+        if not isinstance(resolutions, list) or len({item.get("review_task_id") for item in resolutions}) != len(resolutions):
+            raise LedgerError("人工中标决定审计无效")
+        matches = {match.get("review_task_id"): match for group in ledger["groups"] for match in group["award_matches"]}
+        for resolution in resolutions:
+            task_id = resolution.get("review_task_id")
+            match = matches.get(task_id)
+            if not match or resolution.get("decision") not in {"select_bidder", "deferred"}:
+                raise LedgerError("人工中标决定缺少对应任务")
+            if resolution["decision"] == "select_bidder":
+                record = records.get(resolution.get("record_id"))
+                if (not record or match["status"] != "matched" or match["basis"] != "user_selection" or
+                        match["selected_record_id"] != record["id"] or
+                        resolution.get("company_name") != record["company_name"]):
+                    raise LedgerError("人工选择未正确应用到投标记录")
+            elif match["status"] == "matched":
+                raise LedgerError("标记不确定的中标任务不得自动匹配")
