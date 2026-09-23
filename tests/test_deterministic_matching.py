@@ -242,7 +242,8 @@ class DeterministicMatchingTests(unittest.TestCase):
         first = subprocess.run([sys.executable, "-B", str(ROOT / "scripts" / "excel_ledger.py"), "run",
                                 str(book.path), "--output", str(out)], text=True, capture_output=True)
         self.assertEqual(first.returncode, 3)
-        plan = json.loads(first.stdout)["inspection"]["suggested_plan"]
+        initial = json.loads(first.stdout)
+        plan = json.loads(Path(initial["inspection"]["inspection_path"]).read_text(encoding="utf-8"))["suggested_plan"]
         plan["sources"][0]["sheets"][0]["tables"][0]["award_completeness"] = {
             "status": "complete", "basis_type": "structural",
             "basis": "测试夹具声明为完整最终结果区域",

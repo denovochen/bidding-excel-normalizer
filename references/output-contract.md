@@ -28,10 +28,12 @@
 
 复核交互完成前，草稿和 state 仅保存在内部运行目录，不作为最终文件展示。完成后 `review_queue.csv` 复制仍未解决的 final 行，仅重编号并在证据前添加原因；用户已确认的问题从队列消失，选择不确定的问题继续保留。无法形成 final 的文件级或区域级问题作为独立复核行，不能进入 records、record_count、unique_company_count 或参与记录数。一个输入文件不可解析时，其他正常文件仍可交付；权限、输出损坏和内部不变量失败仍终止并返回 error。
 
-ledger 保存 sources、mapping、matching_policy、projects/groups、records、issues、resolutions、row_audit、summary、unique_companies 和 CSV 哈希。`groups.award_matches` 保存原中标名、单元格、推荐候选、人工选择、依据与状态；`occurrences.column_evidence` 保存上下文/辅助列。内部 ID 不是官方编号。
+ledger 保存 sources、mapping、matching_policy、projects/groups、records、issues、resolutions、row_audit、summary、unique_companies 和 CSV 哈希。启用跨表关系时还保存 relationships 与 relationship_resolutions。`groups.award_matches` 保存原中标名、单元格、推荐候选、人工选择、依据与状态；`occurrences.column_evidence` 保存上下文/辅助列。内部 ID 不是官方编号。
+
+`relationships` 必须包含可追溯的来源项目快照、目标项目、候选和组级链接。项目关系确定但标段范围不可靠时，相关记录只保留项目字段，标段字段为空，并由 `LOT_SCOPE_UNRESOLVED` 关联到 `review_queue.csv`；不能把项目级“否”解释为任何具体标段的未中标结论。
 
 真实单表范围或必须保留的结构超限属于文件级可恢复失败：整份文件记录为 `sources.status=unreadable`，保留文件名、哈希和包含 Sheet/触发位置/阈值的 error，并产生 `SOURCE_UNREADABLE` 独立复核行；其他来源继续处理，不交付该文件的截断数据。文件大小、解压规模、Sheet 数、有效单元格总数及结构展开规模限制仍为批次级错误。全部输入均可恢复失败时，允许发布仅有失败审计的三个产物，final.csv 只有表头，业务记录与企业数量为0；退出码0表示产物发布成功，不代表输入解析成功。
 
 unique_companies 从 final 非空公司名按 NFKC、去空白、casefold 去重，保持首次顺序并包含待复核名称；它不是已确认工商实体数。CSV 公式形文本加单引号并保存可恢复记录。发布前校验名称来源、组归属、置信度、表头、统计、哈希和复核关联。
 
-1.6 增加组级中标确认、内置提问工具批次、Other 输入、不确定决定和可恢复 state；删除法人/金额自动匹配。旧版结果仍可只读 validate；旧 plan 应重新 inspect 后使用，新结果不得覆盖原目录。
+1.7 增加跨表项目关系审计。关系只在 plan 显式声明时启用；旧 plan 继续使用原单表逻辑。项目名称不精确时只保存脚本提供的有界候选和结构化决定；不能通过中标企业反向选择项目。旧版结果仍可只读 validate，新结果不得覆盖原目录。

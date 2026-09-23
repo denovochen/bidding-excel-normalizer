@@ -128,7 +128,10 @@ def validate_outputs(output: Path) -> dict[str, Any]:
     records = ledger["records"]
     if len(records) != len(final) or [r["final_sequence"] for r in records] != list(range(1, len(final) + 1)):
         raise LedgerError("ledger 记录与 final 序号不一致")
-    for collection in (records, ledger["projects"], ledger["groups"], ledger["issues"]):
+    collections = [records, ledger["projects"], ledger["groups"], ledger["issues"]]
+    if "relationships" in ledger:
+        collections.append(ledger["relationships"])
+    for collection in collections:
         if len({r["id"] for r in collection}) != len(collection):
             raise LedgerError("ledger 存在重复内部 ID")
     project_ids = {p["id"] for p in ledger["projects"]}
@@ -199,6 +202,39 @@ def validate_outputs(output: Path) -> dict[str, Any]:
         "duplicate_mentions_removed": sum(len(r["occurrences"]) - 1 for r in records),
         "corrected_record_count": sum(bool(r["corrections"]) for r in records),
     }
+    if "relationships" in ledger:
+        relationships = ledger["relationships"]
+        expected_counts.update({
+            "relationship_count": len(relationships),
+            "unresolved_relationship_count": sum(item["status"] != "matched" for item in relationships),
+        })
+        target_ids = {item.get("target_project_id") for item in relationships if item.get("target_project_id")}
+        if not target_ids <= project_ids:
+            raise LedgerError("跨表关系引用未知目标项目")
+        candidate_ids = {candidate["project_id"] for item in relationships for candidate in item.get("candidates", [])}
+        if not candidate_ids <= project_ids:
+            raise LedgerError("跨表关系候选引用未知目标项目")
+        source_ids = {source["id"] for source in ledger["sources"]}
+        for relation in relationships:
+            snapshot = relation.get("source_project")
+            if (not isinstance(snapshot, dict) or snapshot.get("id") != relation.get("source_project_id") or
+                    snapshot.get("source_id") not in source_ids or not isinstance(snapshot.get("values"), dict) or
+                    not isinstance(snapshot.get("cells"), dict)):
+                raise LedgerError("跨表关系缺少可追溯的来源项目快照")
+        resolutions = ledger.get("relationship_resolutions")
+        if not isinstance(resolutions, list) or len({item.get("review_task_id") for item in resolutions}) != len(resolutions):
+            raise LedgerError("项目关系人工决定审计无效")
+        relations_by_task = {item.get("review_task_id"): item for item in relationships}
+        for resolution in resolutions:
+            relation = relations_by_task.get(resolution.get("review_task_id"))
+            if not relation or resolution.get("decision") not in {"select_project", "deferred"}:
+                raise LedgerError("项目关系决定缺少对应任务")
+            if resolution["decision"] == "select_project":
+                if (relation["status"] != "matched" or relation["basis"] != "user_selection" or
+                        relation["target_project_id"] != resolution.get("project_id")):
+                    raise LedgerError("项目关系人工选择未正确应用")
+            elif relation["status"] == "matched":
+                raise LedgerError("标记不确定的项目关系不得自动匹配")
     if ledger["summary"] != expected_counts:
         raise LedgerError("summary 与明细计数不一致")
     return {"validated": True, "summary": expected_counts}

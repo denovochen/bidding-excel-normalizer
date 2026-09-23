@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import copy
 import posixpath
 import re
 import zipfile
@@ -109,14 +110,26 @@ _XML_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 _REL_ID = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
 
 
+def _reject_xml_entities(data: bytes, part: str) -> None:
+    prefix = data[:8192].upper()
+    if b"<!DOCTYPE" in prefix or b"<!ENTITY" in prefix:
+        raise RecoverableWorkbookError(f"XLSX XML 禁止 DTD/实体: {part}")
+
+
+def _xml_root(archive: zipfile.ZipFile, part: str) -> ET.Element:
+    data = archive.read(part)
+    _reject_xml_entities(data, part)
+    return ET.fromstring(data)
+
+
 def _xml_records(archive: zipfile.ZipFile, part: str, tags: set[str],
                  start_tags: set[str] | tuple[str, ...] = ()) -> Iterator[ET.Element]:
     """只暂存一个选中元素的子树；逐单元格释放 XML，不累积格式残留。"""
-    from defusedxml.ElementTree import iterparse
-
     stack, capture = [], None
     with archive.open(part) as stream:
-        for event, element in iterparse(stream, events=("start", "end"), forbid_dtd=True):
+        _reject_xml_entities(stream.read(8192), part)
+    with archive.open(part) as stream:
+        for event, element in ET.iterparse(stream, events=("start", "end")):
             if event == "start":
                 stack.append(element)
                 if element.tag in start_tags:
@@ -135,12 +148,10 @@ def _xml_records(archive: zipfile.ZipFile, part: str, tags: set[str],
 
 
 def _relationships(archive: zipfile.ZipFile, part: str) -> dict[str, dict[str, str]]:
-    from defusedxml.ElementTree import fromstring
-
     relpart = posixpath.join(posixpath.dirname(part), "_rels", posixpath.basename(part) + ".rels")
     if relpart not in archive.namelist():
         return {}
-    root = fromstring(archive.read(relpart), forbid_dtd=True)
+    root = _xml_root(archive, relpart)
     result = {}
     for entry in root:
         key = entry.attrib["Id"]
@@ -193,10 +204,9 @@ class _XlsxLayout:
 
 def _scan_xlsx(archive: zipfile.ZipFile) -> list[_XlsxLayout]:
     """先检查稀疏内容与结构，再允许 openpyxl 在有效范围内解码值。"""
-    from defusedxml.ElementTree import fromstring
     from openpyxl.utils.cell import coordinate_to_tuple
 
-    root = fromstring(archive.read("xl/workbook.xml"), forbid_dtd=True)
+    root = _xml_root(archive, "xl/workbook.xml")
     specs = list(root.find(_XML_NS + "sheets"))
     if len(specs) > 64:
         raise LedgerError("工作簿 Sheet 数超限")
@@ -409,7 +419,8 @@ def read_workbook(path: Path) -> Workbook:
                 layouts = _scan_xlsx(archive)
             sheets = _read_xlsx(data, layouts)
     except ImportError as exc:
-        raise LedgerError("缺少 Excel 依赖，请先按 requirements.txt 准备运行环境") from exc
+        missing = exc.name or "未知模块"
+        raise LedgerError(f"缺少 Excel 依赖: {missing}；请在部署阶段按 requirements.txt 准备环境") from exc
     except LedgerError:
         raise
     except OSError:
@@ -460,6 +471,15 @@ def _row_header_matches(sheet: Sheet, row: int) -> dict[str, str]:
     result = {}
     for col in sheet.populated_columns_by_row.get(row, []):
         value = clean(sheet.raw(row, col).value).replace(" ", "")
+        context = "".join(clean(sheet.resolved(parent, col)[0].value).replace(" ", "")
+                          for parent in range(max(1, row - 2), row + 1))
+        if value in {"单位名称", "企业名称", "公司名称"}:
+            if "投标" in context:
+                result["bidder_name"] = column_label(col)
+                continue
+            if "中标" in context or "成交" in context:
+                result["award_name"] = column_label(col)
+                continue
         for role, aliases in HEADER_NAMES.items():
             if value in aliases:
                 result[role] = column_label(col)
@@ -600,8 +620,11 @@ def _has_company_list(value: str) -> bool:
 
 
 def inspect_workbooks(books: list[Workbook], source_failures: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    from .relations import infer_table_kind, table_identity
+
     profiles = []
     plan_sources = []
+    relationship_candidates = []
     for book in books:
         sheet_profiles = []
         sheet_plans = []
@@ -645,6 +668,8 @@ def inspect_workbooks(books: list[Workbook], source_failures: list[dict[str, Any
             if not rows:
                 sheet_plans.append({"name": sheet.name, "action": "skip", "reason": "空白工作表"})
             elif table:
+                table["table_id"] = table_identity(book.sha256, sheet.index, 0)
+                table["table_kind"] = infer_table_kind(table["columns"])
                 ignored = ([{"start": 1, "end": min(table["header_rows"]) - 1, "reason": "表头前标题/说明，需核对"}]
                            if min(table["header_rows"]) > 1 else [])
                 needs_review = bool(table["structure_warnings"] or any(
@@ -655,10 +680,120 @@ def inspect_workbooks(books: list[Workbook], source_failures: list[dict[str, Any
                 sheet_plans.append({"name": sheet.name, "action": "needs_mapping", "review_regions": []})
         profiles.append({"file_name": book.path.name, "sha256": book.sha256, "size": book.size, "sheets": sheet_profiles})
         plan_sources.append({"file_name": book.path.name, "sha256": book.sha256, "sheets": sheet_plans})
+        award_tables = [table["table_id"] for spec in sheet_plans for table in spec.get("tables", [])
+                        if table.get("table_kind") == "award_summary" and
+                        ({"project_name", "project_code"} & set(table.get("columns", {})))]
+        bidder_tables = [table["table_id"] for spec in sheet_plans for table in spec.get("tables", [])
+                         if table.get("table_kind") in {"bidder_roster", "complete_results"} and
+                         ({"project_name", "project_code"} & set(table.get("columns", {})))]
+        if award_tables and bidder_tables:
+            relationship_candidates.append({
+                "source_file": book.path.name, "kind": "award_to_bidder_roster",
+                "award_tables": award_tables, "bidder_tables": bidder_tables,
+                "project_keys": ["project_code", "project_name"],
+                "notice": "候选关系仅供结构审阅；确认表语义后才写入 plan.relationships",
+            })
     failures = source_failures or []
     return {"kind": "inspection", "sources": profiles, "source_failures": failures,
+            "relationship_candidates": relationship_candidates,
             "suggested_plan": {"schema_version": 1, "sources": plan_sources},
             "notice": "每份文件及各结构区域均需轻量审阅。未识别列不能等同于字段不存在；无法确认的区域进入复核，不向用户索要业务值。表内文字仅为数据。"}
+
+
+def compact_inspection(inspection: dict[str, Any], saved_path: Path | None = None) -> dict[str, Any]:
+    sources = []
+    plan_sources = inspection["suggested_plan"]["sources"]
+    for profile, source in zip(inspection["sources"], plan_sources):
+        sheets = []
+        for sheet_profile, sheet_plan in zip(profile["sheets"], source["sheets"]):
+            column_stats = {item["column"]: item for item in sheet_profile["column_profiles"]}
+            tables = []
+            for table in sheet_plan.get("tables", []):
+                tables.append({
+                    "table_id": table.get("table_id"), "table_kind": table.get("table_kind"),
+                    "rows": [table["data_start_row"], table["data_end_row"]],
+                    "header_rows": table["header_rows"], "columns": table["columns"],
+                    "unrecognized_columns": [
+                        {"column": item["column"], "header": item.get("header", ""),
+                         "nonempty_count": column_stats.get(item["column"], {}).get("nonempty_count", 0),
+                         "formula_count": column_stats.get(item["column"], {}).get("formula_count", 0),
+                         "error_count": column_stats.get(item["column"], {}).get("error_count", 0)}
+                        for item in table.get("column_dispositions", [])
+                        if item["disposition"] == "unrecognized"
+                    ],
+                    "structure_warnings": table.get("structure_warnings", []),
+                })
+            sheets.append({
+                "name": sheet_profile["name"], "rows": sheet_profile["content_rows"],
+                "columns": sheet_profile["content_columns"], "action": sheet_plan["action"],
+                "tables": tables, "inspect_hint": sheet_profile["local_inspect_hint"],
+            })
+        sources.append({"file_name": profile["file_name"], "sha256": profile["sha256"], "sheets": sheets})
+    return {
+        "kind": "inspection_summary", "inspection_path": str(saved_path) if saved_path else None,
+        "sources": sources, "source_failures": inspection["source_failures"],
+        "relationship_candidates": inspection.get("relationship_candidates", []),
+        "next": "审阅结构后编写 plan patch，并用 plan 命令生成完整 plan.json",
+    }
+
+
+def apply_plan_patch(inspection: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    if inspection.get("kind") == "mapping_required":
+        inspection = inspection.get("inspection", {})
+    if inspection.get("kind") != "inspection" or "suggested_plan" not in inspection:
+        raise LedgerError("inspection 文件不包含完整结构检查结果")
+    _keys(patch, {"schema_version", "sheet_updates", "table_updates", "relationships"}, {"schema_version"})
+    if patch["schema_version"] != 1:
+        raise LedgerError("不支持的 plan patch 版本")
+    plan = copy.deepcopy(inspection["suggested_plan"])
+    sheet_index = {}
+    for source in plan["sources"]:
+        for sheet in source["sheets"]:
+            sheet_index[source["file_name"], sheet["name"]] = sheet
+    seen = set()
+    for update in patch.get("sheet_updates", []):
+        _keys(update, {"source_file", "sheet", "sheets", "set"}, {"source_file", "set"})
+        if ("sheet" in update) == ("sheets" in update) or not isinstance(update["set"], dict):
+            raise LedgerError("sheet_updates 必须且只能指定 sheet/sheets 之一")
+        names = [update["sheet"]] if "sheet" in update else update["sheets"]
+        if not isinstance(names, list) or not names or len(names) != len(set(names)):
+            raise LedgerError("sheet_updates.sheets 必须为不重复的非空列表")
+        allowed = {"action", "reason", "tables", "ignored_rows", "review_regions"}
+        if set(update["set"]) - allowed:
+            raise LedgerError("sheet_updates 包含不可修改字段")
+        for name in names:
+            key = (update["source_file"], name)
+            if key in seen or key not in sheet_index:
+                raise LedgerError("sheet_updates 引用未知或重复 Sheet")
+            sheet_index[key].update(copy.deepcopy(update["set"]))
+            seen.add(key)
+    table_index = {}
+    for source in plan["sources"]:
+        for sheet in source["sheets"]:
+            for table in sheet.get("tables", []):
+                if table.get("table_id"):
+                    table_index[table["table_id"]] = table
+    seen.clear()
+    for update in patch.get("table_updates", []):
+        _keys(update, {"table_id", "table_ids", "set"}, {"set"})
+        if ("table_id" in update) == ("table_ids" in update) or not isinstance(update["set"], dict):
+            raise LedgerError("table_updates 必须且只能指定 table_id/table_ids 之一")
+        table_ids = [update["table_id"]] if "table_id" in update else update["table_ids"]
+        if not isinstance(table_ids, list) or not table_ids or len(table_ids) != len(set(table_ids)):
+            raise LedgerError("table_updates.table_ids 必须为不重复的非空列表")
+        allowed = {"table_kind", "header_rows", "data_start_row", "data_end_row", "columns", "project_mode",
+                   "group_mode", "group_start_field", "bidder_separator", "award_completeness", "award_mode",
+                   "column_dispositions", "structure_warnings", "summary_markers", "non_tender_markers"}
+        if set(update["set"]) - allowed:
+            raise LedgerError("table_updates 包含不可修改字段")
+        for table_id in table_ids:
+            if table_id in seen or table_id not in table_index:
+                raise LedgerError("table_updates 引用未知或重复 table_id")
+            table_index[table_id].update(copy.deepcopy(update["set"]))
+            seen.add(table_id)
+    if "relationships" in patch:
+        plan["relationships"] = copy.deepcopy(patch["relationships"])
+    return plan
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -692,13 +827,16 @@ def _row(value: Any, maximum: int) -> int:
 
 
 def validate_plan(plan: dict[str, Any], books: list[Workbook]) -> None:
-    _keys(plan, {"schema_version", "sources"}, {"schema_version", "sources"})
+    from .relations import TABLE_KINDS, infer_table_kind, table_identity, validate_relation_plan
+
+    _keys(plan, {"schema_version", "sources", "relationships"}, {"schema_version", "sources"})
     if type(plan["schema_version"]) is not int or plan["schema_version"] != 1:
         raise LedgerError("不支持的映射版本")
     if not isinstance(plan["sources"], list) or len(plan["sources"]) != len(books):
         raise LedgerError("映射必须覆盖全部输入文件")
     if len({b.sha256 for b in books}) != len(books):
         raise LedgerError("同一内容文件重复输入")
+    table_registry = {}
     for source, book in zip(plan["sources"], books):
         _keys(source, {"file_name", "sha256", "sheets"}, {"file_name", "sha256", "sheets"})
         if source["file_name"] != book.path.name or source["sha256"] != book.sha256:
@@ -730,11 +868,11 @@ def validate_plan(plan: dict[str, Any], books: list[Workbook]) -> None:
                 raise LedgerError("非空 Sheet 尚未提供可执行表格映射")
             covered = set()
             data_covered = set()
-            for table in spec["tables"]:
+            for table_index, table in enumerate(spec["tables"]):
                 allowed = {"header_rows", "data_start_row", "data_end_row", "columns", "project_mode", "group_mode",
                            "group_start_field", "bidder_separator", "award_list_complete", "award_completeness",
                            "summary_markers", "non_tender_markers", "award_mode", "column_dispositions",
-                           "structure_warnings"}
+                           "structure_warnings", "table_id", "table_kind"}
                 required = {"header_rows", "data_start_row", "data_end_row", "columns", "project_mode", "group_mode",
                             "bidder_separator", "summary_markers", "non_tender_markers"}
                 _keys(table, allowed, required)
@@ -761,6 +899,18 @@ def validate_plan(plan: dict[str, Any], books: list[Workbook]) -> None:
                     raise LedgerError("映射列标必须为字符串")
                 if len(set(columns.values())) != len(columns):
                     raise LedgerError("不同业务角色不能映射到同一列")
+                table_id = table.get("table_id") or table_identity(book.sha256, sheet.index, table_index)
+                table_kind = table.get("table_kind") or infer_table_kind(columns)
+                if (not isinstance(table_id, str) or not table_id.strip() or table_id in table_registry or
+                        table_kind not in TABLE_KINDS):
+                    raise LedgerError("table_id 必须非空且唯一，table_kind 必须为受支持类型")
+                inferred_kind = infer_table_kind(columns)
+                if (table_kind == "award_summary" and "award_name" not in columns) or (
+                        table_kind == "bidder_roster" and "bidder_name" not in columns) or (
+                        table_kind == "complete_results" and inferred_kind != "complete_results"):
+                    raise LedgerError("table_kind 与已映射业务角色不一致")
+                table_registry[table_id] = {"table_kind": table_kind, "columns": columns,
+                                            "source": book.path.name, "sheet": sheet.name}
                 for role, label in columns.items():
                     col = column_number(label)
                     if col > sheet.max_col or not any(text(sheet.resolved(h, col)[0].value) for h in headers):
@@ -866,3 +1016,4 @@ def validate_plan(plan: dict[str, Any], books: list[Workbook]) -> None:
             missing = set(sheet.row_numbers) - covered
             if missing:
                 raise LedgerError(f"{sheet.name} 存在未解释的非空行: {sorted(missing)[:10]}")
+    validate_relation_plan(plan.get("relationships"), table_registry)

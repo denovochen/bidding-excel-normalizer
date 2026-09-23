@@ -548,7 +548,9 @@ class LedgerTests(unittest.TestCase):
                                 str(b.path), "--output", str(output)], capture_output=True, text=True)
         self.assertEqual(first.returncode, 3)
         plan_path = self.directory / "roster-plan.json"
-        plan_path.write_text(json.dumps(json.loads(first.stdout)["inspection"]["suggested_plan"], ensure_ascii=False),
+        initial = json.loads(first.stdout)
+        stored = json.loads(Path(initial["inspection"]["inspection_path"]).read_text(encoding="utf-8"))
+        plan_path.write_text(json.dumps(stored["suggested_plan"], ensure_ascii=False),
                              encoding="utf-8")
         result = subprocess.run([sys.executable, "-B", str(ROOT / "scripts" / "excel_ledger.py"), "run",
                                  str(b.path), "--plan", str(plan_path), "--output", str(output)],
@@ -821,7 +823,8 @@ class LedgerTests(unittest.TestCase):
         first = subprocess.run([sys.executable, "-B", str(ROOT / "scripts" / "excel_ledger.py"), "run",
                                 str(b.path), str(bad), "--output", str(output)], capture_output=True, text=True)
         self.assertEqual(first.returncode, 3, first.stderr)
-        inspection = json.loads(first.stdout)["inspection"]
+        summary = json.loads(first.stdout)["inspection"]
+        inspection = json.loads(Path(summary["inspection_path"]).read_text(encoding="utf-8"))
         self.assertEqual(len(inspection["source_failures"]), 1)
         plan_path = self.directory / "mixed-plan.json"
         plan_path.write_text(json.dumps(inspection["suggested_plan"], ensure_ascii=False), encoding="utf-8")
