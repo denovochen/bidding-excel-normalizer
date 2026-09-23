@@ -34,7 +34,7 @@ class MappingRevisionRequired(LedgerError):
 
 
 class RecoverableWorkbookError(LedgerError):
-    """单个工作簿无法解析，但同批其他工作簿仍可继续交付。"""
+    """单个工作簿无法解析或真实范围超限，同批其他工作簿仍可继续交付。"""
 
 
 def text(value: object) -> str:

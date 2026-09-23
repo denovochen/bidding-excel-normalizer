@@ -4,12 +4,15 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import posixpath
 import re
 import zipfile
+import xml.etree.ElementTree as ET
+from bisect import bisect_left
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .contract import (BUSINESS_ROLES, LedgerError, MappingRevisionRequired, RecoverableWorkbookError, ROLES,
                        clean, column_label, column_number, coordinate, stable_id, text)
@@ -95,9 +98,256 @@ class Workbook:
         return "source_" + self.sha256[:24]
 
 
-def _bounds(rows: int, cols: int) -> None:
+def _bounds(rows: int, cols: int, context: str = "") -> None:
     if rows > MAX_ROWS or cols > MAX_COLS or rows * cols > MAX_CELLS:
-        raise LedgerError(f"工作表范围超限: {rows} 行 × {cols} 列")
+        raise RecoverableWorkbookError(
+            f"工作表范围超限: {rows} 行 × {cols} 列{context}"
+            f"；上限 {MAX_ROWS} 行、{MAX_COLS} 列、{MAX_CELLS} 个矩形位置")
+
+
+_XML_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+_REL_ID = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+
+
+def _xml_records(archive: zipfile.ZipFile, part: str, tags: set[str],
+                 start_tags: set[str] | tuple[str, ...] = ()) -> Iterator[ET.Element]:
+    """只暂存一个选中元素的子树；逐单元格释放 XML，不累积格式残留。"""
+    from defusedxml.ElementTree import iterparse
+
+    stack, capture = [], None
+    with archive.open(part) as stream:
+        for event, element in iterparse(stream, events=("start", "end"), forbid_dtd=True):
+            if event == "start":
+                stack.append(element)
+                if element.tag in start_tags:
+                    yield element
+                if capture is None and element.tag in tags:
+                    capture = len(stack)
+            else:
+                if capture == len(stack):
+                    yield element
+                    capture = None
+                if capture is None:
+                    if len(stack) > 1:
+                        stack[-2].remove(element)
+                    element.clear()
+                stack.pop()
+
+
+def _relationships(archive: zipfile.ZipFile, part: str) -> dict[str, dict[str, str]]:
+    from defusedxml.ElementTree import fromstring
+
+    relpart = posixpath.join(posixpath.dirname(part), "_rels", posixpath.basename(part) + ".rels")
+    if relpart not in archive.namelist():
+        return {}
+    root = fromstring(archive.read(relpart), forbid_dtd=True)
+    result = {}
+    for entry in root:
+        key = entry.attrib["Id"]
+        if key in result:
+            raise RecoverableWorkbookError(f"XLSX 关系重复: {part}")
+        result[key] = dict(entry.attrib)
+    return result
+
+
+def _related_part(part: str, relation: dict[str, str]) -> str:
+    if relation.get("TargetMode") == "External":
+        raise RecoverableWorkbookError(f"XLSX 内部结构指向外部资源: {part}")
+    target = relation["Target"]
+    target = posixpath.normpath(target.lstrip("/") if target.startswith("/") else
+                               posixpath.join(posixpath.dirname(part), target))
+    if target.startswith("../"):
+        raise RecoverableWorkbookError(f"XLSX 关系路径无效: {part}")
+    return target
+
+
+def _range(ref: str) -> tuple[int, int, int, int]:
+    from openpyxl.utils.cell import range_boundaries
+
+    left, top, right, bottom = range_boundaries(ref)
+    if (None in (top, left, bottom, right) or not 1 <= top <= bottom <= 1048576 or
+            not 1 <= left <= right <= 16384):
+        raise RecoverableWorkbookError(f"XLSX 坐标范围无效: {ref}")
+    return top, left, bottom, right
+
+
+@dataclass
+class _XlsxLayout:
+    name: str
+    part: str
+    content: dict[tuple[int, int], tuple[bool, bool]] = field(default_factory=dict)
+    merges: list[tuple[int, int, int, int]] = field(default_factory=list)
+    hidden_rows: list[int] = field(default_factory=list)
+    hidden_columns: list[tuple[int, int]] = field(default_factory=list)
+    hyperlinks: list[tuple[tuple[int, int, int, int], str]] = field(default_factory=list)
+    extent: tuple[int, int, int, int] | None = None
+
+    def include(self, bounds: tuple[int, int, int, int], reason: str) -> None:
+        top, left, bottom, right = bounds
+        if self.extent:
+            a, b, c, d = self.extent
+            top, left, bottom, right = min(a, top), min(b, left), max(c, bottom), max(d, right)
+        _bounds(bottom, right, f"；Sheet={self.name}；{reason}")
+        self.extent = top, left, bottom, right
+
+
+def _scan_xlsx(archive: zipfile.ZipFile) -> list[_XlsxLayout]:
+    """先检查稀疏内容与结构，再允许 openpyxl 在有效范围内解码值。"""
+    from defusedxml.ElementTree import fromstring
+    from openpyxl.utils.cell import coordinate_to_tuple
+
+    root = fromstring(archive.read("xl/workbook.xml"), forbid_dtd=True)
+    specs = list(root.find(_XML_NS + "sheets"))
+    if len(specs) > 64:
+        raise LedgerError("工作簿 Sheet 数超限")
+    relations = _relationships(archive, "xl/workbook.xml")
+    strings = bytearray()
+    for relation in relations.values():
+        if relation["Type"].endswith("/sharedStrings"):
+            part = _related_part("xl/workbook.xml", relation)
+            for element in _xml_records(archive, part, {_XML_NS + "si"}):
+                strings.append(any(t.text for t in element.findall(_XML_NS + "t") +
+                                   element.findall(_XML_NS + "r/" + _XML_NS + "t")))
+    layouts, count = [], 0
+    for spec in specs:
+        relation = relations[spec.attrib[_REL_ID]]
+        if not relation["Type"].endswith("/worksheet"):
+            raise RecoverableWorkbookError(f"不支持的 Sheet 类型: {spec.attrib['name']}")
+        layout = _XlsxLayout(spec.attrib["name"], _related_part("xl/workbook.xml", relation))
+        sheet_rels = _relationships(archive, layout.part)
+        row, col = 0, 0
+        tags = {_XML_NS + tag for tag in ("c", "col", "mergeCell", "hyperlink")}
+        for element in _xml_records(archive, layout.part, tags, {_XML_NS + "row"}):
+            tag = element.tag.removeprefix(_XML_NS)
+            if tag == "row":
+                next_row = int(element.get("r", row + 1))
+                if next_row <= row:
+                    raise RecoverableWorkbookError(f"XLSX 行号未递增: {layout.name}")
+                row, col = next_row, 0
+                if element.get("hidden") in {"1", "true"} and row <= MAX_ROWS:
+                    layout.hidden_rows.append(row)
+            elif tag == "col":
+                if element.get("hidden") in {"1", "true"}:
+                    layout.hidden_columns.append((int(element.attrib["min"]), int(element.attrib["max"])))
+            elif tag == "c":
+                r, c = coordinate_to_tuple(element.attrib["r"]) if "r" in element.attrib else (row, col + 1)
+                if r != row or c <= col or not 1 <= r <= 1048576 or not 1 <= c <= 16384:
+                    raise RecoverableWorkbookError(f"XLSX 单元格坐标无效或重复: {layout.name}!{element.get('r')}")
+                col = c
+                formula = element.find(_XML_NS + "f")
+                error = element.get("t") == "e"
+                value = element.findtext(_XML_NS + "v")
+                present = value not in (None, "")
+                if element.get("t") == "s" and present:
+                    index = int(value)
+                    if not 0 <= index < len(strings):
+                        raise RecoverableWorkbookError(f"共享字符串索引无效: {layout.name}!{coordinate(r, c)}")
+                    present = bool(strings[index])
+                elif element.get("t") == "inlineStr":
+                    present = any(t.text for t in element.findall(_XML_NS + "is/" + _XML_NS + "t") +
+                                  element.findall(_XML_NS + "is/" + _XML_NS + "r/" + _XML_NS + "t"))
+                if present or formula is not None or error:
+                    layout.include((r, c, r, c), f"内容单元格={coordinate(r, c)}")
+                    layout.content[r, c] = (formula is not None, error)
+                    count += 1
+                    if count > MAX_CELLS:
+                        raise LedgerError("工作簿有效单元格数超限")
+                    if formula is not None and formula.get("ref"):
+                        layout.include(_range(formula.attrib["ref"]), f"公式范围={formula.attrib['ref']}")
+            elif tag == "mergeCell":
+                layout.merges.append(_range(element.attrib["ref"]))
+                if len(layout.merges) > MAX_CELLS:
+                    raise LedgerError("工作表合并结构规模超限")
+            elif tag == "hyperlink":
+                ref = element.attrib["ref"]
+                bounds = _range(ref)
+                layout.include(bounds, f"超链接={ref}")
+                target = (sheet_rels[element.attrib[_REL_ID]]["Target"] if _REL_ID in element.attrib else
+                          element.get("location"))
+                if target:
+                    layout.hyperlinks.append((bounds, target))
+        # 批注和表定义不是纯格式；检查其范围，但不把说明文字或外链缓存当作业务值。
+        for relation in sheet_rels.values():
+            kind = relation["Type"].rsplit("/", 1)[-1]
+            if kind not in {"comments", "threadedComment", "table"}:
+                continue
+            part = _related_part(layout.part, relation)
+            tags = ({_XML_NS + "comment"} if kind == "comments" else {_XML_NS + "table"} if kind == "table" else
+                    {"{http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments}threadedComment"})
+            for element in _xml_records(archive, part, tags):
+                ref = element.attrib["ref"]
+                layout.include(_range(ref), f"{kind}={ref}")
+        anchored = [area for area in layout.merges if area[:2] in layout.content]
+        for area in anchored:
+            layout.include(area, f"有内容合并={coordinate(area[0], area[1])}:{coordinate(area[2], area[3])}")
+        seed = layout.extent
+        # 相交判断固定使用内容/有值合并边界；不让空白合并链不断扩张范围。
+        layout.merges = [area for area in layout.merges if seed and
+                         area[0] <= seed[2] and area[2] >= seed[0] and area[1] <= seed[3] and area[3] >= seed[1]]
+        for area in layout.merges:
+            layout.include(area, f"保留合并={coordinate(area[0], area[1])}:{coordinate(area[2], area[3])}")
+        if sum(d - b + 1 for a, b, c, d in layout.merges) > MAX_CELLS:
+            raise LedgerError("工作表合并索引规模超限")
+        # 只读模式不会像普通模式那样删除合并非锚点的原始值；拒绝这种冲突，避免继承时掩盖内容。
+        rows_by_col: dict[int, list[int]] = {}
+        for r, c in layout.content:
+            rows_by_col.setdefault(c, []).append(r)
+        for top, left, bottom, right in layout.merges:
+            for c in range(left, right + 1):
+                rows = rows_by_col.get(c, [])
+                offset = bisect_left(rows, top)
+                if c == left and offset < len(rows) and rows[offset] == top:
+                    offset += 1
+                if offset < len(rows) and rows[offset] <= bottom:
+                    raise RecoverableWorkbookError(
+                        f"合并区域非锚点含真实内容: {layout.name}!{coordinate(rows[offset], c)}")
+        layouts.append(layout)
+    return layouts
+
+
+def _read_xlsx(data: bytes, layouts: list[_XlsxLayout]) -> list[Sheet]:
+    import openpyxl
+
+    book = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=False, keep_links=False)
+    try:
+        if [s.title for s in book] != [layout.name for layout in layouts]:
+            raise LedgerError("XLSX 预扫描与读取的 Sheet 不一致")
+        sheets, count = [], 0
+        for index, (sheet, layout) in enumerate(zip(book, layouts)):
+            cells = {}
+            bottom, right = layout.extent[2:] if layout.extent else (0, 0)
+            if layout.content:
+                for r, row in enumerate(sheet.iter_rows(min_row=1, max_row=bottom, min_col=1, max_col=right), 1):
+                    for c, cell in enumerate(row, 1):
+                        if (r, c) in layout.content:
+                            formula, error = layout.content[r, c]
+                            if cell.value is None and not (formula or error):
+                                raise RecoverableWorkbookError(f"XLSX 内容无法解码: {layout.name}!{coordinate(r, c)}")
+                            cells[r, c] = Cell(cell.value, formula, error or cell.data_type == "e", cell.number_format)
+                if cells.keys() != layout.content.keys():
+                    raise RecoverableWorkbookError(f"XLSX 单元格读取不完整: {layout.name}")
+            result = Sheet(sheet.title, index, cells, layout.merges, sheet.sheet_state != "visible",
+                           [r for r in layout.hidden_rows if r <= bottom],
+                           sorted({c for start, end in layout.hidden_columns for c in range(max(1, start), min(right, end) + 1)}))
+            # 普通模式会为无值超链接填入 target/location；只读模式需要显式保留这一行为。
+            visits = 0
+            for (top, left, end, last), target in layout.hyperlinks:
+                visits += (end - top + 1) * (last - left + 1)
+                if visits > MAX_CELLS:
+                    raise LedgerError("工作表超链接规模超限")
+                for r in range(top, end + 1):
+                    for c in range(left, last + 1):
+                        _, a, b = result.resolved(r, c)
+                        if (top, left) != (end, last) and (a, b) != (r, c):
+                            continue
+                        cells.setdefault((a, b), Cell(target))
+            count += len(cells)
+            if count > MAX_CELLS:
+                raise LedgerError("工作簿有效单元格数超限")
+            sheets.append(result)
+        return sheets
+    finally:
+        book.close()
 
 
 def read_workbook(path: Path) -> Workbook:
@@ -120,9 +370,11 @@ def read_workbook(path: Path) -> Workbook:
 
             book = xlrd.open_workbook(file_contents=data, formatting_info=True, on_demand=True)
             try:
+                if book.nsheets > 64:
+                    raise LedgerError("工作簿 Sheet 数超限")
                 for index in range(book.nsheets):
                     sheet = book.sheet_by_index(index)
-                    _bounds(sheet.nrows, sheet.ncols)
+                    _bounds(sheet.nrows, sheet.ncols, f"；Sheet={sheet.name}")
                     cells = {}
                     for r in range(sheet.nrows):
                         for c in range(sheet.ncols):
@@ -154,24 +406,13 @@ def read_workbook(path: Path) -> Workbook:
                     raise RecoverableWorkbookError("XLSX 目录无效")
                 if any(item.flag_bits & 1 for item in entries) or any("vbaProject" in n for n in names):
                     raise RecoverableWorkbookError("不支持加密或带宏的工作簿")
-            import openpyxl
-
-            book = openpyxl.load_workbook(io.BytesIO(data), data_only=False, keep_links=False)
-            try:
-                for index, sheet in enumerate(book):
-                    _bounds(sheet.max_row, sheet.max_column)
-                    cells = {(cell.row, cell.column): Cell(cell.value, cell.data_type == "f", cell.data_type == "e", cell.number_format)
-                             for row in sheet.iter_rows() for cell in row if cell.value is not None}
-                    sheets.append(Sheet(sheet.title, index, cells,
-                                        [(x.min_row, x.min_col, x.max_row, x.max_col) for x in sheet.merged_cells.ranges],
-                                        sheet.sheet_state != "visible",
-                                        [r for r, v in sheet.row_dimensions.items() if v.hidden],
-                                        [column_number(c) for c, v in sheet.column_dimensions.items() if v.hidden]))
-            finally:
-                book.close()
+                layouts = _scan_xlsx(archive)
+            sheets = _read_xlsx(data, layouts)
     except ImportError as exc:
         raise LedgerError("缺少 Excel 依赖，请先按 requirements.txt 准备运行环境") from exc
     except LedgerError:
+        raise
+    except OSError:
         raise
     except Exception as exc:
         raise RecoverableWorkbookError(f"Excel 无法读取: {path.name} ({type(exc).__name__})") from exc
