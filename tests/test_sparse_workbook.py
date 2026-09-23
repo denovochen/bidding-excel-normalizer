@@ -420,7 +420,7 @@ class SparseWorkbookTests(unittest.TestCase):
             for name, data in entries.items():
                 archive.writestr(name, data)
         with patch.object(openpyxl, "load_workbook") as load:
-            with self.assertRaisesRegex(RecoverableWorkbookError, "DTDForbidden"):
+            with self.assertRaisesRegex(RecoverableWorkbookError, "禁止 DTD/实体"):
                 reader.read_workbook(path)
             load.assert_not_called()
 
@@ -466,7 +466,8 @@ class SparseWorkbookTests(unittest.TestCase):
                     first, payload = self.cli("run", *order, "--output", output)
                     self.assertEqual(first.returncode, 3, first.stderr)
                     self.assertFalse(output.exists())
-                    inspection = payload["inspection"]
+                    summary = payload["inspection"]
+                    inspection = json.loads(Path(summary["inspection_path"]).read_text(encoding="utf-8"))
                     failure = inspection["source_failures"][0]
                     self.assertEqual(failure["file_name"], "B.xlsx")
                     self.assertIn("KN1", failure["error"])
@@ -494,7 +495,8 @@ class SparseWorkbookTests(unittest.TestCase):
         first, payload = self.cli("run", good, bad, "--output", output)
         self.assertEqual(first.returncode, 3, first.stderr)
         plan = self.directory / "plan.json"
-        plan.write_text(json.dumps(payload["inspection"]["suggested_plan"]), encoding="utf-8")
+        stored = json.loads(Path(payload["inspection"]["inspection_path"]).read_text(encoding="utf-8"))
+        plan.write_text(json.dumps(stored["suggested_plan"]), encoding="utf-8")
         second, payload = self.cli("run", good, bad, "--plan", plan, "--output", output)
         self.assertEqual(second.returncode, 4, second.stderr)
         answers = self.directory / "answers.json"

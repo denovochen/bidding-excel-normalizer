@@ -1,6 +1,30 @@
 # 字段映射 v1
 
-每次 `run` 都先返回 `mapping_required`，供 Agent 轻量审阅每份文件和各结构区域。沿用 `inspection.suggested_plan` 的文件名、哈希和 Sheet 顺序，在工作区保存 plan.json 后执行 `run --plan`。模型只理解结构并修订声明式计划，不逐行处理企业、不判断名称对应、不修改解析源码。
+每次首次 `run` 都返回有界 `mapping_required` 摘要并将完整 inspection 保存到内部工作目录。模型只审阅摘要和必要的局部 `inspect --sheet --rows`，编写 plan patch，不读取完整 inspection 到上下文，不逐行处理企业、不判断企业名称对应、不修改解析源码。
+
+执行 `python scripts/excel_ledger.py plan --inspection <inspection.json> --patch <patch.json> --output <plan.json>` 生成完整 plan，再执行 `run --plan <plan.json>`。patch 和 plan 保存在 inspection 所在的内部工作目录，最终 `--output` 必须位于该目录之外。patch 只允许 `sheet_updates`、`table_updates` 和 `relationships`；表通过稳定 `table_id` 引用，避免模型重写完整 plan。
+
+多个同结构年度表可在一个更新中使用 `table_ids`；多个 Sheet 可使用 `sheets`。只在结构确实一致时批量应用：
+
+```json
+{
+  "schema_version": 1,
+  "sheet_updates": [{
+    "source_file": "原文件.xlsx",
+    "sheets": ["2019投标信息", "2020投标信息"],
+    "set": {"action": "parse"}
+  }],
+  "table_updates": [{
+    "table_ids": ["table_2019", "table_2020"],
+    "set": {
+      "table_kind": "bidder_roster",
+      "columns": {"project_name": "D", "bidder_name": "I"},
+      "project_mode": "merged",
+      "group_mode": "project"
+    }
+  }]
+}
+```
 
 每个 Sheet 使用 `parse`、`review` 或有 reason 的 `skip`。`skip` 仅适合空表或已明确非业务内容；非空 skip 仍会生成复核项。无法可靠解释的业务区域使用 `review_regions`，不能跳过后宣称全部完成。parse 示例：
 
@@ -11,6 +35,8 @@
   "ignored_rows": [{"start": 1, "end": 1, "reason": "标题"}],
   "review_regions": [],
   "tables": [{
+    "table_id": "table_...",
+    "table_kind": "complete_results",
     "header_rows": [2],
     "data_start_row": 3,
     "data_end_row": 100,
@@ -31,9 +57,13 @@
 }
 ```
 
+`table_kind` 是根据已映射标准角色确认的区域语义：`award_summary`、`bidder_roster`、`complete_results` 或 `other`。它不是对原表字段名、Sheet 名或列位置的要求。原表“单位名称”只有在多层表头上下文明确属于“投标单位信息”时才映射为 `bidder_name`；不能把所有“单位名称”全局硬编码为投标企业。
+
 XLSX 有效内容由 OOXML 稀疏预扫描确定，空白样式不会产生业务列；0、False、公式、错误及隐藏单元格中的内容不能丢弃。保留原坐标和相关合并，表头仍通过合并锚点继承。超过读取范围的真实内容或必须保留的合并按整份文件失败记录在 `inspection.source_failures`，不能在 plan 中静默忽略超限列；其余文件继续结构审阅。
 
 所有有效列必须有明确去向。`columns` 保存业务字段和匹配辅助字段；其余列逐项写入 `column_dispositions`：
+
+有公式或错误的可选辅助列应先看摘要中的 `formula_count/error_count`。若该字段不是本次业务结果或匹配所必需，保留为 `evidence`，不要为了“多提取字段”映射成业务角色并制造大范围不可用问题。项目名称、投标单位和中标单位等关系必需字段不可因此忽略。
 
 | disposition | 含义 |
 |---|---|

@@ -1,4 +1,4 @@
-"""持久化组级中标确认，并生成内置提问工具所需的有界问题。 @author denovochen"""
+"""持久化项目关系与组级中标确认，并生成有界复核问题。 @author denovochen"""
 from __future__ import annotations
 
 import json
@@ -37,6 +37,7 @@ def _award_tasks(ledger: dict[str, Any]) -> list[dict[str, Any]]:
             project.get("values", {}).get("project_code")) or "（原表未提供项目名称）"
         question = f"项目：{project_name}\n原中标企业：{match['original_award']}\n\n请选择对应的投标企业"
         tasks.append({
+            "task_type": "award",
             "review_task_id": task_id,
             "issue_id": issue["id"],
             "group_id": group["id"],
@@ -64,20 +65,70 @@ def _award_tasks(ledger: dict[str, Any]) -> list[dict[str, Any]]:
         task["source_id"], task["sheet"], task["anchor_row"], task["review_task_id"]))
 
 
+def _relation_tasks(ledger: dict[str, Any]) -> list[dict[str, Any]]:
+    issues = {issue.get("review_task_id"): issue for issue in ledger["issues"] if issue.get("review_task_id")}
+    tasks = []
+    for relation in ledger.get("relationships", []):
+        task_id = relation.get("review_task_id")
+        candidates = relation.get("candidates", [])
+        if relation.get("status") == "matched" or not task_id or not candidates:
+            continue
+        issue = issues.get(task_id, {})
+        options = [{
+            "label": f"{candidate['project_name']}（{candidate['sheet']}）",
+            "value": candidate["project_id"],
+        } for candidate in candidates]
+        options.append({"label": "不确定", "value": "unresolved"})
+        evidence = "\n".join(
+            f"{index}. {candidate['project_name']}：{'；'.join(candidate['evidence'])}"
+            for index, candidate in enumerate(candidates, 1))
+        tasks.append({
+            "task_type": "relation", "review_task_id": task_id,
+            "issue_id": issue.get("id"), "source_project_id": relation["source_project_id"],
+            "source_project_name": relation["source_project_name"], "candidates": candidates,
+            "question": {
+                "question_id": task_id,
+                "question": (f"中标汇总项目：{relation['source_project_name']}\n\n候选依据：\n{evidence}"
+                             "\n\n请选择对应的投标明细项目；不能可靠确认时选择不确定。"),
+                "options": options, "multi_select": False, "allow_other": False,
+            },
+        })
+    return sorted(tasks, key=lambda task: (task["source_project_name"], task["review_task_id"]))
+
+
+def _all_tasks(ledger: dict[str, Any]) -> list[dict[str, Any]]:
+    return _relation_tasks(ledger) + _award_tasks(ledger)
+
+
 def pending_questions(ledger: dict[str, Any], decisions: dict[str, dict]) -> tuple[list[dict], int, int]:
-    tasks = _award_tasks(ledger)
+    tasks = _all_tasks(ledger)
     pending = [task for task in tasks if task["review_task_id"] not in decisions]
-    questions = [task["question"] for task in pending[:QUESTION_BATCH_SIZE]]
+    relation_pending = [task for task in pending if task["task_type"] == "relation"]
+    selected = relation_pending if relation_pending else pending
+    questions = [task["question"] for task in selected[:QUESTION_BATCH_SIZE]]
     return questions, len(tasks), len(pending)
 
 
+def split_decisions(decisions: dict[str, dict]) -> tuple[dict[str, dict], dict[str, dict]]:
+    relation = {key: value for key, value in decisions.items() if key.startswith("relation_review_")}
+    award = {key: value for key, value in decisions.items() if not key.startswith("relation_review_")}
+    return relation, award
+
+
 def create_state(inputs: list[Path], plan: dict, output: Path, generated_at: str,
-                 review_task_count: int) -> Path:
+                 review_task_count: int, work_directory: Path | None = None) -> Path:
     resolved_output = output.expanduser().absolute()
     resolved_output.parent.mkdir(parents=True, exist_ok=True)
-    directory = resolved_output.parent / (".excel-ledger-work-" + uuid.uuid4().hex)
-    directory.mkdir(parents=False, exist_ok=False)
+    if work_directory is None:
+        directory = resolved_output.parent / (".excel-ledger-work-" + uuid.uuid4().hex)
+        directory.mkdir(parents=False, exist_ok=False)
+    else:
+        directory = work_directory.expanduser().resolve(strict=True)
+        if not directory.is_dir() or not directory.name.startswith(".excel-ledger-work-"):
+            raise LedgerError("内部工作目录无效")
     state_path = directory / "state.json"
+    if state_path.exists():
+        raise LedgerError("复核状态已存在")
     state = {
         "schema_version": STATE_SCHEMA,
         "parser_version": VERSION,
@@ -143,7 +194,7 @@ def _answer_value(answer: Any) -> str:
 
 
 def apply_answers(state: dict[str, Any], ledger: dict[str, Any], answers: dict[str, Any]) -> list[dict[str, str]]:
-    tasks = {task["review_task_id"]: task for task in _award_tasks(ledger)}
+    tasks = {task["review_task_id"]: task for task in _all_tasks(ledger)}
     records_by_group: dict[str, list[dict]] = {}
     for record in ledger["records"]:
         records_by_group.setdefault(record["group_id"], []).append(record)
@@ -166,6 +217,16 @@ def apply_answers(state: dict[str, Any], ledger: dict[str, Any], answers: dict[s
             continue
         if name_key(value) in {name_key(item) for item in DEFERRED_VALUES}:
             decisions[task_id] = {"decision": "deferred", "decided_at": _timestamp()}
+            continue
+        if task["task_type"] == "relation":
+            candidate = next((item for item in task["candidates"] if item["project_id"] == value), None)
+            if not candidate:
+                errors.append({"question_id": task_id, "message": "所选项目不属于当前关系候选"})
+                continue
+            decisions[task_id] = {
+                "decision": "select_project", "project_id": candidate["project_id"],
+                "project_name": candidate["project_name"], "decided_at": _timestamp(),
+            }
             continue
         group_records = records_by_group.get(task["group_id"], [])
         selected = next((record for record in group_records if record["id"] == value), None)
@@ -197,12 +258,16 @@ def apply_answers(state: dict[str, Any], ledger: dict[str, Any], answers: dict[s
 
 def review_result(state_path: Path, ledger: dict[str, Any], state: dict[str, Any],
                   validation_errors: list[dict[str, str]] | None = None) -> dict[str, Any]:
-    questions, _, remaining = pending_questions(ledger, state["decisions"])
+    questions, total, remaining = pending_questions(ledger, state["decisions"])
+    state["review_task_count"] = max(state["review_task_count"], total)
+    relation_ids = {task["review_task_id"] for task in _relation_tasks(ledger)}
+    relation_review = bool(questions and questions[0]["question_id"] in relation_ids)
     return {
-        "kind": "award_review_required",
-        "message": "请使用内置向用户提问工具确认非精确中标名称对应的投标企业。",
+        "kind": "relationship_review_required" if relation_review else "award_review_required",
+        "message": ("请确认非精确项目名称对应的投标明细项目。" if relation_review else
+                    "请使用内置向用户提问工具确认非精确中标名称对应的投标企业。"),
         "state": str(state_path),
-        "review_task_count": state["review_task_count"],
+        "review_task_count": total,
         "remaining_task_count": remaining,
         "questions": questions,
         "validation_errors": validation_errors or [],
@@ -215,3 +280,17 @@ def cleanup_state(path: Path) -> None:
     parent = resolved.parent
     if resolved.name == "state.json" and parent.name.startswith(".excel-ledger-work-"):
         shutil.rmtree(parent)
+
+
+def create_work_directory(output: Path) -> Path:
+    resolved = output.expanduser().absolute()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    directory = resolved.parent / (".excel-ledger-work-" + uuid.uuid4().hex)
+    directory.mkdir(parents=False, exist_ok=False)
+    return directory
+
+
+def cleanup_work_directory(directory: Path) -> None:
+    resolved = directory.expanduser().resolve(strict=True)
+    if resolved.is_dir() and resolved.name.startswith(".excel-ledger-work-"):
+        shutil.rmtree(resolved)

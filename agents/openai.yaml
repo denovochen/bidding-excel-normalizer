@@ -1,4 +1,4 @@
 interface:
   display_name: "招投标 Excel 台账整理"
-  short_description: "整理招投标 Excel，必要时确认中标企业并交付可审计结果"
-  default_prompt: "使用 $bidding-excel-normalizer 整理我上传的 Excel，遇到非精确中标名称时让我选择对应投标企业。"
+  short_description: "识别陌生招投标 Excel、关联跨表项目并交付可审计结果"
+  default_prompt: "使用 $bidding-excel-normalizer 整理我上传的 Excel；按标准角色理解陌生表头，必要时处理跨 Sheet 项目关系和中标企业确认。"

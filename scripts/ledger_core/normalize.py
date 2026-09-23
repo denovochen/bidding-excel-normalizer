@@ -9,6 +9,7 @@ from .contract import (FIELDS, VERSION, LedgerError, MappingRevisionRequired, cl
                        name_key, stable_id, text)
 from .workbook import HEADER_NAMES, Workbook, Sheet, validate_plan
 from .names import POLICY, match_group
+from .relations import apply_relationships, infer_table_kind, table_identity
 
 EMPTY_NAMES = {"", "/", "-", "—", "无", "暂无", "未招标", "未招投标", "未确定", "待定", "未中标", "否", "不适用", "待招标", "未开标"}
 COMPANY_END = re.compile(r"(?:公司|工程队|工程处|合作社|事务所|中心|研究院|设计院|厂|经营部)$")
@@ -160,6 +161,8 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
     current_group = None
     current_group_context = {}
     columns = table["columns"]
+    table_id = table.get("table_id") or table_identity(book.sha256, sheet.index, table_index)
+    table_kind = table.get("table_kind") or infer_table_kind(columns)
     award_mode = table.get("award_mode", "auto")
     completeness = _award_completeness(table)
     context_specs = [item for item in table.get("column_dispositions", [])
@@ -229,6 +232,7 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
                 current_group_context = {}
             current_project = projects.setdefault(pid, {
                 "id": pid, "source_id": book.source_id, "sheet": sheet.name, "anchor": project_anchor,
+                "table_id": table_id, "table_kind": table_kind,
                 "values": {k: values.get(k, "") for k in context_roles},
                 "cells": {k: cells[k] for k in context_roles if k in cells},
             })
@@ -305,6 +309,7 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
         gid = stable_id("group", scope_key, table_index, group_mode, group_anchor)
         current_group = groups.setdefault(gid, {
             "id": gid, "project_id": project_id, "source_id": book.source_id,
+            "table_id": table_id, "table_kind": table_kind,
             "sheet": sheet.name, "anchor_row": row, "lot_name": clean(values.get("lot_name")),
             "lot_code": clean(values.get("lot_code")), "records": [], "awards": [], "counts": [],
             "non_tender": False, "procurement_signals": [], "award_completeness_declared": completeness,
@@ -504,7 +509,8 @@ def _issue_identity(issue: dict[str, Any]) -> str:
     elif issue.get("record_name"):
         scope = ("record", issue.get("record_name"), tuple(issue.get("conflicting_fields", [])))
     elif issue.get("source_id") and not issue.get("group_id"):
-        scope = ("source", issue.get("source_id"), issue.get("sheet"), issue.get("start_row"), issue.get("end_row"))
+        scope = ("source", issue.get("source_id"), issue.get("sheet"), issue.get("start_row"), issue.get("end_row"),
+                 issue.get("source_project_id"), issue.get("target_project_id"))
     else:
         scope = ("group",)
     return stable_id("issue", issue.get("group_id"), issue["code"], scope)
@@ -547,7 +553,8 @@ def _record_confidence(record: dict[str, Any], group: dict[str, Any], related: l
 def build_outputs(books: list[Workbook], plan: dict[str, Any], alias_payload: dict[str, Any] | None = None,
                   generated_at: str | None = None,
                   source_failures: list[dict[str, Any]] | None = None,
-                  award_resolutions: dict[str, dict] | None = None) -> tuple[list[dict], list[dict], dict]:
+                  award_resolutions: dict[str, dict] | None = None,
+                  relation_resolutions: dict[str, dict] | None = None) -> tuple[list[dict], list[dict], dict]:
     validate_plan(plan, books)
     alias_payload = alias_payload or {"schema_version": 1, "aliases": []}
     if aliases_from_json(alias_payload):
@@ -561,6 +568,7 @@ def build_outputs(books: list[Workbook], plan: dict[str, Any], alias_payload: di
         raise LedgerError("生成时间必须为带时区的 ISO 8601") from exc
     source_failures = source_failures or []
     award_resolutions = award_resolutions or {}
+    relation_resolutions = relation_resolutions or {}
     projects, groups, issues, row_audit, skipped = [], [], [], [], []
     for failure in source_failures:
         issues.append(_issue("SOURCE_UNREADABLE", failure["error"], None, standalone=True,
@@ -592,6 +600,8 @@ def build_outputs(books: list[Workbook], plan: dict[str, Any], alias_payload: di
                                      sheet=sheet.name, start_row=region["start"], end_row=region["end"],
                                      reason=region["reason"]))
     projects = list({p["id"]: p for p in projects}.values())
+    projects, groups, issues, relationships = apply_relationships(
+        projects, groups, issues, plan, relation_resolutions)
     for group in groups:
         finish_group(group, issues, award_resolutions)
     project_by_id = {p["id"]: p for p in projects}
@@ -723,4 +733,12 @@ def build_outputs(books: list[Workbook], plan: dict[str, Any], alias_payload: di
                   "XLS 读取缓存值，xlrd 不提供可靠公式文本标记；本工具不计算公式。",
                   "内部项目/组 ID 仅对同一文件内容和同一映射稳定；不是官方编号。"],
     }
+    if plan.get("relationships"):
+        ledger["relationships"] = relationships
+        ledger["relationship_resolutions"] = [dict({"review_task_id": task_id}, **resolution)
+                                               for task_id, resolution in sorted(relation_resolutions.items())]
+        ledger["summary"].update({
+            "relationship_count": len(relationships),
+            "unresolved_relationship_count": sum(item["status"] != "matched" for item in relationships),
+        })
     return final, review, ledger
