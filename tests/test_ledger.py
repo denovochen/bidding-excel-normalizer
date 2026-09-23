@@ -16,8 +16,9 @@ import openpyxl
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 from ledger_core.artifacts import publish, validate_outputs
-from ledger_core.contract import FIELDS, LedgerError
+from ledger_core.contract import FIELDS, LedgerError, MappingRevisionRequired
 from ledger_core.normalize import aliases_from_json, build_outputs, normalize_name, split_names
+from ledger_core.review import pending_questions
 from ledger_core.workbook import inspect_workbooks, load_json, read_workbook, validate_plan
 
 TIME = "2026-09-20T12:00:00+08:00"
@@ -484,14 +485,10 @@ class LedgerTests(unittest.TestCase):
         self.assertFalse(r)
         publish(self.directory / "out", f, r, ledger)
 
-    def test_missing_project_cell_does_not_block_known_company(self):
+    def test_bidder_with_mapped_project_role_but_no_project_fails_fast(self):
         b, p = self.book([["项目名称", "投标单位名称"], [None, "甲公司"], ["乙项目", "乙公司"]])
-        f, r, ledger = self.build(b, p)
-        self.assertEqual([x["项目名称"] for x in f], ["", "乙项目"])
-        self.assertEqual([x["公司名称"] for x in f], ["甲公司", "乙公司"])
-        self.assertEqual(ledger["summary"]["project_count"], 1)
-        self.assertFalse(r)
-        publish(self.directory / "out", f, r, ledger)
+        with self.assertRaisesRegex(MappingRevisionRequired, "缺少项目归属"):
+            self.build(b, p)
 
     def test_project_row_with_empty_company_is_kept_without_fabrication(self):
         b, p = self.book([["项目名称", "投标单位名称", "中标单位", "备注"],
@@ -679,6 +676,15 @@ class LedgerTests(unittest.TestCase):
         self.assertIn("'+甲公司", (out / "final.csv").read_text(encoding="utf-8-sig"))
         self.assertTrue(validate_outputs(out)["validated"])
 
+    def test_csv_record_count_does_not_use_physical_text_lines(self):
+        b, plan = self.book([["项目名称", "投标单位名称"], ["项目甲", "甲建设\n工程有限公司"]])
+        output = self.directory / "multiline-output"
+        publish(output, *self.build(b, plan))
+        physical_lines = len((output / "final.csv").read_text(encoding="utf-8-sig").splitlines()) - 1
+        checked = validate_outputs(output)
+        self.assertGreater(physical_lines, 1)
+        self.assertEqual(checked["summary"]["record_count"], 1)
+
     def test_malformed_and_fake_extension_are_rejected(self):
         path = self.directory / "fake.xls"
         path.write_bytes(b"not an excel workbook")
@@ -730,6 +736,95 @@ class LedgerTests(unittest.TestCase):
         final, _, ledger = self.build(b, plan)
         self.assertEqual([row["项目名称"] for row in final], ["项目甲", "项目甲"])
         self.assertEqual(ledger["summary"]["project_count"], 1)
+
+    def test_partial_project_merge_ending_before_bidder_block_is_inherited(self):
+        b, plan = self.book([
+            ["项目名称", "标段", "投标单位名称"],
+            ["项目甲", "一标段", "甲公司"], [None, None, "乙公司"], [None, None, "丙公司"],
+            [None, None, "丁公司"], [None, None, "戊公司"],
+        ], ("A2:A4",))
+        table = plan["sources"][0]["sheets"][0]["tables"][0]
+        table["group_mode"] = "anchor"
+        table["group_start_field"] = "lot_name"
+        final, review, ledger = self.build(b, plan)
+        self.assertEqual([row["项目名称"] for row in final], ["项目甲"] * 5)
+        self.assertEqual(ledger["summary"]["bidder_roster_projectless_record_count"], 0)
+        self.assertFalse(review)
+
+    def test_project_context_can_start_from_project_text_in_lot_anchor(self):
+        b, plan = self.book([
+            ["项目名称", "标段", "投标单位名称"],
+            ["项目甲", "一标段", "甲公司"], [None, None, "乙公司"],
+            [None, "项目乙工程施工标段", "丙公司"], [None, None, "丁公司"],
+        ])
+        table = plan["sources"][0]["sheets"][0]["tables"][0]
+        table["project_mode"] = "blocks"
+        table["group_mode"] = "anchor"
+        table["group_start_field"] = "lot_name"
+        table["project_context_fields"] = ["lot_name"]
+        final, review, ledger = self.build(b, plan)
+        self.assertEqual([row["项目名称"] for row in final], ["项目甲", "项目甲", "项目乙工程施工标段", "项目乙工程施工标段"])
+        self.assertEqual([row["标段名称"] for row in final], ["一标段", "一标段", "", ""])
+        self.assertEqual(ledger["summary"]["project_count"], 2)
+        self.assertFalse(review)
+
+    def test_bidder_serial_is_not_suggested_as_project_serial(self):
+        b, plan = self.book([
+            ["项目名称", "投标单位信息", None],
+            [None, "序号", "单位名称"],
+            ["项目甲", 1, "甲公司"], [None, 2, "乙公司"],
+        ], ("A1:A2", "B1:C1"))
+        table = plan["sources"][0]["sheets"][0]["tables"][0]
+        self.assertEqual(table["columns"]["bidder_serial"], "B")
+        self.assertNotIn("project_serial", table["columns"])
+
+    def test_incomplete_bidder_candidates_block_exact_award_and_questions(self):
+        b, plan = self.book([
+            ["项目名称", "投标单位名称", "中标单位"],
+            ["项目甲", "甲公司", "甲公司"], ["项目甲", "坏)公司", None],
+        ])
+        final, review, ledger = self.build(b, plan)
+        self.assertEqual([(row["公司名称"], row["中标与否"]) for row in final], [("甲公司", "")])
+        self.assertTrue(review)
+        self.assertEqual(ledger["groups"][0]["award_matches"][0]["status"], "blocked")
+        self.assertEqual(pending_questions(ledger, {})[2], 0)
+        self.assertIn("BIDDER_CANDIDATE_COVERAGE_INCOMPLETE", {issue["code"] for issue in ledger["issues"]})
+
+    def test_multiple_malformed_bidder_rows_keep_independent_review_items(self):
+        b, plan = self.book([
+            ["项目名称", "投标单位名称"],
+            ["项目甲", "坏)公司"], ["项目甲", "另)坏公司"],
+        ])
+        final, review, ledger = self.build(b, plan)
+        issues = [issue for issue in ledger["issues"] if issue["code"] == "BIDDER_LIST_AMBIGUOUS"]
+        self.assertFalse(final)
+        self.assertEqual({issue["source_row"] for issue in issues}, {2, 3})
+        self.assertEqual(len(review), 2)
+
+    def test_award_only_bidder_count_is_evidence_not_record_count_check(self):
+        b, plan = self.book([
+            ["项目名称", "投标企业数量", "中标单位"],
+            ["项目甲", 5, "甲公司"],
+        ])
+        final, review, ledger = self.build(b, plan)
+        self.assertEqual([(row["公司名称"], row["中标与否"]) for row in final], [("甲公司", "是")])
+        self.assertNotIn("BIDDER_COUNT_MISMATCH", {issue["code"] for issue in ledger["issues"]})
+        self.assertFalse(review)
+
+    def test_current_validator_keeps_read_only_legacy_summary_compatible(self):
+        b, plan = self.book([["项目名称", "投标单位名称"], ["项目甲", "甲公司"]])
+        output = self.directory / "legacy-output"
+        publish(output, *self.build(b, plan))
+        ledger_path = output / "ledger.json"
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        ledger["parser_version"] = "1.7.0"
+        for key in (
+            "bidder_roster_projectless_record_count", "cross_block_duplicate_participation_count",
+            "cross_block_deduplication_count", "incomplete_bidder_group_count",
+        ):
+            ledger["summary"].pop(key)
+        ledger_path.write_text(json.dumps(ledger, ensure_ascii=False), encoding="utf-8")
+        self.assertTrue(validate_outputs(output)["validated"])
 
     def test_repeated_bidder_count_is_not_used_as_group_anchor(self):
         b, plan = self.book([["项目名称", "投标单位名称", "投标单位数量", "中标单位"],

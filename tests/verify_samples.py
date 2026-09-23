@@ -68,13 +68,14 @@ def yixing_fixture_plan(book) -> dict:
     _configure_table(construction, {
         "project_year": "C", "project_name": "D", "lot_name": "G", "project_owner": "H",
         "agent": "I", "bidder_count": "M", "award_name": "O", "award_price": "S", "notes": "U",
-    }, "award_summary", "merged", "lot", "complete")
+    }, "award_summary", "blocks", "lot", "complete")
     for table in rosters:
         _configure_table(table, {
-            "project_year": "C", "project_name": "D", "lot_name": "G", "bidder_name": "I",
+            "project_year": "C", "project_name": "D", "lot_name": "G", "bidder_serial": "H", "bidder_name": "I",
             "bidder_price": "K",
-        }, "bidder_roster", "merged", "anchor", "partial")
+        }, "bidder_roster", "blocks", "anchor", "partial")
         table["group_start_field"] = "lot_name"
+        table["project_context_fields"] = ["lot_name"]
     for table in award_only:
         existing = table["columns"]
         _configure_table(table, {
@@ -139,22 +140,74 @@ def verify_yixing(path: Path, output: Path) -> dict:
     final, review, ledger = build_outputs(
         [book], plan, generated_at=draft[2]["generated_at"],
         relation_resolutions=relation, award_resolutions=award)
-    expected = {
-        "project_count": 205,
-        "group_count": 214,
-        "record_count": 10244,
-        "review_record_count": 785,
-        "issue_count": 9,
-        "relationship_count": 67,
-        "unresolved_relationship_count": 0,
-    }
-    for key, value in expected.items():
-        if ledger["summary"][key] != value:
-            raise AssertionError(f"yixing: {key}: {ledger['summary'][key]} != {value}")
-    if task_types != {"relationship": 19, "award": 11} or len(state["decisions"]) != 30:
-        raise AssertionError("宜兴样本复核任务统计不符合已核验基线")
+    if ledger["summary"]["bidder_roster_projectless_record_count"] != 0:
+        raise AssertionError("宜兴年度 bidder roster 仍存在无项目归属记录")
+    if ledger["summary"]["cross_block_deduplication_count"] != 0:
+        raise AssertionError("宜兴样本仍发生跨来源投标块去重")
     if any(record["sheet"] == "施工招标汇总" for record in ledger["records"]):
         raise AssertionError("施工中标汇总应关联到年度投标名册，不应作为重复企业记录发布")
+    anomaly_ranges = {
+        "宜兴市2019年度施工标段投标信息": [(454, 515)],
+        "宜兴市2020年度施工标段投标信息": [(328, 416)],
+        "宜兴市2023年度施工标段投标信息": [(1777, 2089), (2090, 2379), (2380, 2665)],
+        " 宜兴市2025年度施工标段投标信息": [(642, 999)],
+    }
+    for record in ledger["records"]:
+        ranges = anomaly_ranges.get(record["sheet"], [])
+        if any(start <= occurrence["row"] <= end for start, end in ranges for occurrence in record["occurrences"]):
+            if record["company_role"] == "bidder_name" and record["company_name"] and not record["project_id"]:
+                raise AssertionError("6 个异常投标块仍存在 projectless bidder")
+    records_by_source_row = {}
+    for record in ledger["records"]:
+        for occurrence in record["occurrences"]:
+            records_by_source_row.setdefault((record["sheet"], occurrence["row"]), []).append(record)
+    xushe_records = {
+        record["id"] for row in range(454, 516)
+        for record in records_by_source_row.get(("宜兴市2019年度施工标段投标信息", row), [])
+        if record["company_name"]
+    }
+    if len(xushe_records) != 62:
+        raise AssertionError(f"2019 徐舍佘圩片应保留 62 家投标企业，实际 {len(xushe_records)}")
+    winner_rows = {
+        ("宜兴市2019年度施工标段投标信息", 461): "南京长城建设发展有限公司",
+        ("宜兴市2023年度施工标段投标信息", 2012): "江苏必和必拓建设有限公司",
+        ("宜兴市2023年度施工标段投标信息", 2333): "江苏鑫慧达建设工程有限公司",
+    }
+    for key, company in winner_rows.items():
+        matches = [record for record in records_by_source_row.get(key, []) if name_key(record["company_name"]) == name_key(company)]
+        if len(matches) != 1 or final[matches[0]["final_sequence"] - 1]["中标与否"] != "是":
+            raise AssertionError(f"准确中标企业未由完整来源块精确识别: {company}")
+        group = next(group for group in ledger["groups"] if group["id"] == matches[0]["group_id"])
+        match = next(item for item in group["award_matches"] if item["selected_record_id"] == matches[0]["id"])
+        if match["basis"] != "exact_name":
+            raise AssertionError(f"准确中标企业不应依赖人工选择: {company}")
+    incorrect_selections = {
+        "南京骏豪建设工程有限公司", "江阴市水利机械施工工程有限公司", "江苏伟鼎建设工程有限公司",
+    }
+    if any(item.get("decision") == "select_bidder" and item.get("company_name") in incorrect_selections
+           for item in ledger["resolutions"]):
+        raise AssertionError("已确认的三次错误人工选择仍出现在新结果中")
+    groups = {group["id"]: group for group in ledger["groups"]}
+    false_count_issues = [issue for issue in ledger["issues"] if issue["code"] == "BIDDER_COUNT_MISMATCH" and
+                          groups.get(issue.get("group_id"), {}).get("sheet") in {"监理招标统计", "勘察设计招标统计"}]
+    if false_count_issues:
+        raise AssertionError("监理/勘察设计 award-only 表仍产生伪 BIDDER_COUNT_MISMATCH")
+    text_issues = {issue.get("source_row") for issue in ledger["issues"]
+                   if issue["code"] == "BIDDER_LIST_AMBIGUOUS" and
+                   groups.get(issue.get("group_id"), {}).get("sheet") == "宜兴市2019年度施工标段投标信息"}
+    if not {283, 284} <= text_issues:
+        raise AssertionError("2019 高塍镇括号不配对企业名必须继续独立复核")
+    multilot_records = [record for record in ledger["records"] if record["sheet"] == "宜兴市2023年度施工标段投标信息" and
+                        any(2924 <= occurrence["row"] for occurrence in record["occurrences"]) and
+                        any(occurrence["row"] <= 3894 for occurrence in record["occurrences"]) and
+                        record["project_id"] == records_by_source_row[("宜兴市2023年度施工标段投标信息", 2924)][0]["project_id"]]
+    blocks_by_name = {}
+    for record in multilot_records:
+        blocks_by_name.setdefault(name_key(record["company_name"]), set()).update(
+            occurrence["source_block_id"] for occurrence in record["occurrences"])
+    preserved_cross_lot = sum(max(0, len(blocks) - 1) for blocks in blocks_by_name.values())
+    if preserved_cross_lot != 342:
+        raise AssertionError(f"徐舍镇两标段应保留 342 次重复参与，实际 {preserved_cross_lot}")
     lot_issue_ids = {issue["id"] for issue in ledger["issues"] if issue["code"] == "LOT_SCOPE_UNRESOLVED"}
     for record, row in zip(ledger["records"], final):
         if lot_issue_ids.intersection(record["issue_ids"]) and (row["标段名称"] or row["标段编号"]):

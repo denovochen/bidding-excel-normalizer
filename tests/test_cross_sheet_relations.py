@@ -300,12 +300,43 @@ class CrossSheetRelationTests(unittest.TestCase):
         plan = self.plan(book)
         final, review, ledger = build_outputs([book], plan)
         self.assertEqual([(row["公司名称"], row["中标与否"]) for row in final],
-                         [("甲公司", "是"), ("乙公司", "是"), ("丙公司", "否")])
+                         [("甲公司", ""), ("乙公司", ""), ("丙公司", ""),
+                          ("甲公司", ""), ("乙公司", ""), ("丙公司", "")])
         self.assertTrue(all(not row["标段名称"] and not row["标段编号"] for row in final))
         self.assertTrue(all(row["复核状态"] == "待复核" for row in final))
-        self.assertEqual(len(review), 3)
-        self.assertEqual({issue["code"] for issue in ledger["issues"]}, {"LOT_SCOPE_UNRESOLVED"})
+        self.assertEqual(len(review), 6)
+        self.assertIn("LOT_SCOPE_UNRESOLVED", {issue["code"] for issue in ledger["issues"]})
+        self.assertEqual(ledger["summary"]["cross_block_duplicate_participation_count"], 3)
+        self.assertEqual(ledger["summary"]["cross_block_deduplication_count"], 0)
         self.assertTrue(ledger["relationships"][0].get("project_level_fallback_group_id"))
+
+    def test_incomplete_bidder_block_stops_relation_and_award_recommendation(self):
+        book = self.book(
+            [["项目名称", "中标单位"], ["项目甲", "甲公司"]],
+            [["项目名称", "投标单位名称"], ["项目甲", "甲公司"], ["项目甲", "坏)公司"]],
+        )
+        plan = self.plan(book)
+        final, review, ledger = build_outputs([book], plan)
+        self.assertEqual([(row["公司名称"], row["中标与否"]) for row in final], [("甲公司", "")])
+        self.assertEqual(ledger["relationships"][0]["status"], "blocked")
+        self.assertIn("PROJECT_RELATION_COVERAGE_INCOMPLETE", {issue["code"] for issue in ledger["issues"]})
+        self.assertEqual(pending_questions(ledger, {})[2], 0)
+        self.assertTrue(review)
+
+    def test_bidder_count_gap_blocks_relation_before_award_consumption(self):
+        book = self.book(
+            [["项目名称", "中标单位"], ["项目甲", "甲公司"]],
+            [["项目名称", "投标单位名称", "投标企业数量"],
+             ["项目甲", "甲公司", 3], ["项目甲", "乙公司", 3]],
+        )
+        plan = self.plan(book)
+        final, review, ledger = build_outputs([book], plan)
+        self.assertEqual([row["中标与否"] for row in final], ["", ""])
+        self.assertEqual(ledger["relationships"][0]["status"], "blocked")
+        self.assertIn("BIDDER_COUNT_MISMATCH", {issue["code"] for issue in ledger["issues"]})
+        self.assertIn("PROJECT_RELATION_COVERAGE_INCOMPLETE", {issue["code"] for issue in ledger["issues"]})
+        self.assertEqual(pending_questions(ledger, {})[2], 0)
+        self.assertTrue(review)
 
     def test_output_validation_requires_relation_source_snapshot(self):
         book = self.book(

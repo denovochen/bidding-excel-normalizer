@@ -71,7 +71,7 @@ def _relation_tasks(ledger: dict[str, Any]) -> list[dict[str, Any]]:
     for relation in ledger.get("relationships", []):
         task_id = relation.get("review_task_id")
         candidates = relation.get("candidates", [])
-        if relation.get("status") == "matched" or not task_id or not candidates:
+        if relation.get("status") in {"matched", "blocked"} or not task_id or not candidates:
             continue
         issue = issues.get(task_id, {})
         options = [{

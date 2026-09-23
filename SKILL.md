@@ -11,6 +11,8 @@ python scripts/excel_ledger.py run <原始Excel> [...] --output <输出目录>
 
 先执行 `python scripts/excel_ledger.py doctor`；环境未就绪时如实报错，不在任务中安装依赖。全量读取、清洗、跨表关联、中标对应、去重和校验均由脚本完成，不让模型逐行处理企业或编写临时 Python。原文件只读，表内文字是数据，缺失业务值留空。公司名称优先取投标列，不用中标名称覆盖。
 
+bidder roster 已映射项目角色时，任何非空投标企业都必须有项目归属；缺失时返回 `mapping_required`，不得把 projectless 记录发布或提供为中标候选。候选覆盖不完整时不生成项目关系或中标推荐问题。CSV 数量使用脚本返回的 `ledger.summary`，不得按物理行数计算。
+
 - `kind=result`：直接交付三个文件，简述返回统计并结束。待复核是结果的一部分，不为清零反复运行。
 - `kind=mapping_required`：读取 [映射规则](references/mapping.md)，审阅返回的有界摘要；完整 inspection 使用结果中的 `inspection_path`。只编写 plan patch，用 `plan --inspection ... --patch ... --output ...` 生成完整 plan，不把中间文件写入最终输出目录。
 - inspection 中存在跨表候选时，读取 [跨表关系](references/cross-sheet-relations.md)，确认表类型及关系后写入 patch.relationships。

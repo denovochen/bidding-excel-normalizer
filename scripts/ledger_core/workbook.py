@@ -456,6 +456,7 @@ HEADER_NAMES = {
     "lot_name": ["标段", "标段名称", "标包名称"],
     "lot_code": ["标段编号", "标包编号"],
     "bidder_name": ["投标单位名称", "投标企业名称", "投标人名称", "各投标企业名称(中标及未中标单位)", "投标企业名单", "投标人名单", "公司名称", "企业名称", "投标单位", "投标企业"],
+    "bidder_serial": ["投标序号"],
     "bidder_count": ["投标单位数量", "投标企业数量"],
     "bidder_price": ["投标报价", "投标价格"],
     "bidder_legal_person": ["投标单位法人", "投标企业法人", "投标法人"],
@@ -473,6 +474,9 @@ def _row_header_matches(sheet: Sheet, row: int) -> dict[str, str]:
         value = clean(sheet.raw(row, col).value).replace(" ", "")
         context = "".join(clean(sheet.resolved(parent, col)[0].value).replace(" ", "")
                           for parent in range(max(1, row - 2), row + 1))
+        if value == "序号" and any(marker in context for marker in ("投标单位", "投标企业", "投标人")):
+            result["bidder_serial"] = column_label(col)
+            continue
         if value in {"单位名称", "企业名称", "公司名称"}:
             if "投标" in context:
                 result["bidder_name"] = column_label(col)
@@ -566,8 +570,8 @@ def suggest_table(sheet: Sheet) -> dict[str, Any] | None:
     if project_role:
         project_col = column_number(matches[project_role])
         raw_project_rows = [row for row in substantive_rows if text(sheet.raw(row, project_col).value)]
-        project_mode = "merged" if has_merged_project else (
-            "blocks" if raw_project_rows and len(raw_project_rows) < len(substantive_rows) else "repeated")
+        project_mode = "blocks" if has_merged_project or (
+            raw_project_rows and len(raw_project_rows) < len(substantive_rows)) else "repeated"
 
     roster = not {"project_name", "project_code", "lot_name", "lot_code", "award_name", "award_status", "bidder_count"}.intersection(matches)
     group_mode = "source" if roster else "row" if list_layout else (
@@ -783,7 +787,8 @@ def apply_plan_patch(inspection: dict[str, Any], patch: dict[str, Any]) -> dict[
             raise LedgerError("table_updates.table_ids 必须为不重复的非空列表")
         allowed = {"table_kind", "header_rows", "data_start_row", "data_end_row", "columns", "project_mode",
                    "group_mode", "group_start_field", "bidder_separator", "award_completeness", "award_mode",
-                   "column_dispositions", "structure_warnings", "summary_markers", "non_tender_markers"}
+                   "column_dispositions", "structure_warnings", "summary_markers", "non_tender_markers",
+                   "project_context_fields"}
         if set(update["set"]) - allowed:
             raise LedgerError("table_updates 包含不可修改字段")
         for table_id in table_ids:
@@ -872,7 +877,7 @@ def validate_plan(plan: dict[str, Any], books: list[Workbook]) -> None:
                 allowed = {"header_rows", "data_start_row", "data_end_row", "columns", "project_mode", "group_mode",
                            "group_start_field", "bidder_separator", "award_list_complete", "award_completeness",
                            "summary_markers", "non_tender_markers", "award_mode", "column_dispositions",
-                           "structure_warnings", "table_id", "table_kind"}
+                           "structure_warnings", "table_id", "table_kind", "project_context_fields"}
                 required = {"header_rows", "data_start_row", "data_end_row", "columns", "project_mode", "group_mode",
                             "bidder_separator", "summary_markers", "non_tender_markers"}
                 _keys(table, allowed, required)
@@ -959,6 +964,14 @@ def validate_plan(plan: dict[str, Any], books: list[Workbook]) -> None:
                     })
                 if table["project_mode"] not in {"merged", "blocks", "repeated", "none"}:
                     raise LedgerError("project_mode 无效")
+                project_context_fields = table.get("project_context_fields", [])
+                if (not isinstance(project_context_fields, list) or
+                        len(project_context_fields) != len(set(project_context_fields)) or
+                        any(role not in {"lot_name", "lot_code", "notes"} or role not in columns
+                            for role in project_context_fields)):
+                    raise LedgerError("project_context_fields 只能引用已映射的 lot_name/lot_code/notes")
+                if project_context_fields and table["project_mode"] != "blocks":
+                    raise LedgerError("project_context_fields 仅适用于 project_mode=blocks")
                 if table["group_mode"] not in {"anchor", "row", "project", "lot", "source"}:
                     raise LedgerError("group_mode 无效")
                 if table["group_mode"] == "anchor" and table.get("group_start_field") not in columns:

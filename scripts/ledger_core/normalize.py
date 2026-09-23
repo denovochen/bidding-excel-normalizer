@@ -13,6 +13,8 @@ from .relations import apply_relationships, infer_table_kind, table_identity
 
 EMPTY_NAMES = {"", "/", "-", "—", "无", "暂无", "未招标", "未招投标", "未确定", "待定", "未中标", "否", "不适用", "待招标", "未开标"}
 COMPANY_END = re.compile(r"(?:公司|工程队|工程处|合作社|事务所|中心|研究院|设计院|厂|经营部)$")
+PROJECT_CONTEXT = re.compile(r"(?:项目|工程)")
+EMPTY_LOTS = {"", "/", "-", "—", "主标段", "施工标段", "本标段", "全部标段"}
 
 
 def procurement_signal(notes: str, markers: list[str]) -> str | None:
@@ -154,6 +156,21 @@ def _award_completeness(table: dict[str, Any]) -> dict[str, str]:
             "basis": "兼容旧版布尔映射；重新 inspect 后应提供区域级依据"}
 
 
+def _project_context_value(sheet: Sheet, row: int, table: dict[str, Any]) -> tuple[str | None, str, str]:
+    for role in table.get("project_context_fields", []):
+        cell, source_row, source_col = sheet.resolved(row, column_number(table["columns"][role]))
+        direct = sheet.raw(row, column_number(table["columns"][role]))
+        value = "" if direct.formula or direct.error else clean(direct.value)
+        if value and PROJECT_CONTEXT.search(value):
+            return role, value, coordinate(source_row, source_col)
+    return None, "", ""
+
+
+def _lot_value(value: object) -> str:
+    value = clean(value)
+    return "" if value in EMPTY_LOTS else value
+
+
 def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_index: int,
                   aliases: dict[str, dict[str, str]], project_scope_index: int | None = None) -> tuple[list, list, list, list]:
     projects, groups, issues, row_audit = {}, {}, [], []
@@ -208,9 +225,26 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
             })
         raw_project = text(sheet.raw(row, project_col).value) if project_col else ""
         mode = table["project_mode"]
+        project_context_role = None
         if mode == "blocks":
             if raw_project:
                 project_anchor = cells[project_role]
+            elif project_role:
+                project_context_role, project_context, project_context_cell = _project_context_value(sheet, row, table)
+                if project_context_role:
+                    project_anchor = project_context_cell
+                    values["project_name"] = project_context
+                    cells["project_name"] = project_context_cell
+                    if project_context_role in {"lot_name", "lot_code"}:
+                        values[project_context_role] = ""
+                elif current_project:
+                    project_anchor = current_project["anchor"]
+                    for role in context_roles:
+                        values[role] = current_project["values"].get(role, "")
+                        if role in current_project["cells"]:
+                            cells[role] = current_project["cells"][role]
+                else:
+                    project_anchor = ""
             elif current_project:
                 project_anchor = current_project["anchor"]
                 for role in context_roles:
@@ -235,6 +269,8 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
                 "table_id": table_id, "table_kind": table_kind,
                 "values": {k: values.get(k, "") for k in context_roles},
                 "cells": {k: cells[k] for k in context_roles if k in cells},
+                "context_fallback": ({"role": project_context_role, "cell": cells["project_name"]}
+                                     if project_context_role else None),
             })
         elif mode != "blocks":
             if current_project is not None:
@@ -263,6 +299,13 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
             row_audit.append({**audit, "type": "context_only", "values": values, "raw_values": raw_values, "cells": cells})
             continue
         project_id = current_project["id"] if current_project else None
+        if (company_role == "bidder_name" and project_role and source_company and not project_id):
+            raise MappingRevisionRequired(
+                f"{sheet.name} 第 {row} 行投标企业缺少项目归属，不能进入中标候选或发布",
+                {"source": book.path.name, "sheet": sheet.name, "row": row,
+                 "bidder_cell": cells.get("bidder_name"), "project_role": project_role,
+                 "project_mode": mode, "project_context_fields": table.get("project_context_fields", [])},
+            )
         group_context = {}
         group_context_cells = {}
         for item in context_specs:
@@ -290,6 +333,8 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
         if group_mode == "anchor":
             anchor_field = table["group_start_field"]
             new_group = bool(text(sheet.raw(row, column_number(columns[anchor_field])).value))
+            if not new_group and current_group and anchor_field in {"lot_name", "lot_code"}:
+                values[anchor_field] = current_group[anchor_field]
             group_anchor = row if new_group else (current_group["anchor_row"] if current_group else None)
             if group_anchor is None:
                 group_anchor = row  # 缺少组锚点时按来源行隔离，不虚构项目或阻断企业提取。
@@ -310,24 +355,27 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
         current_group = groups.setdefault(gid, {
             "id": gid, "project_id": project_id, "source_id": book.source_id,
             "table_id": table_id, "table_kind": table_kind,
-            "sheet": sheet.name, "anchor_row": row, "lot_name": clean(values.get("lot_name")),
-            "lot_code": clean(values.get("lot_code")), "records": [], "awards": [], "counts": [],
+            "sheet": sheet.name, "anchor_row": row, "lot_name": _lot_value(values.get("lot_name")),
+            "lot_code": _lot_value(values.get("lot_code")), "records": [], "awards": [], "counts": [],
             "non_tender": False, "procurement_signals": [], "award_completeness_declared": completeness,
             "award_completeness": {}, "source_rows": [],
             "scope_type": "roster" if group_mode == "source" else "context" if context_record else "business",
             "company_role": company_role,
             "award_mode": award_mode, "group_mode": group_mode, "project_mode": mode, "table_index": table_index,
             "group_context": group_context, "group_context_cells": group_context_cells,
+            "project_required": bool(project_role), "source_block_ids": [gid],
+            "candidate_coverage": {"complete": True, "reasons": []},
             "price_units": price_units,
             "price_unit_assumption": "未标单位的一侧沿用另一侧" if len(price_units) == 2 and bool(price_units.get("bidder_price")) != bool(price_units.get("award_price")) else "",
         })
         group = current_group
         for role in ("lot_name", "lot_code"):
-            if clean(values.get(role)) and clean(values[role]) != group[role]:
+            current_lot = _lot_value(values.get(role))
+            if current_lot and current_lot != group[role]:
                 raise MappingRevisionRequired(f"{sheet.name} 第 {row} 行组内标段信息不一致，请核对 group_mode", {
                     "source": book.path.name, "sheet": sheet.name, "row": row,
                     "group_start_row": group["anchor_row"], "field": role,
-                    "existing": group[role], "current": clean(values[role]),
+                    "existing": group[role], "current": current_lot,
                 })
         group["source_rows"].append(row)
         for role in ("award_status", "rank"):
@@ -384,6 +432,7 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
                 "id": stable_id("record", book.sha256, sheet.index, table_index, row, index),
                 "name": name, "project_id": project_id, "group_id": gid,
                 "occurrences": [{**occurrence, "fragment_index": index, "raw_company": raw, "company_role": company_role,
+                                 "source_block_id": gid,
                                  "single_bidder_row": company_role == "bidder_name" and len(tokens) == 1 and not _vertical_merge(sheet, row, "bidder_name", columns)}],
                 "changes": changes, "award_status": "", "rank": values.get("rank", "") if len(tokens) == 1 else "",
                 "explicit_award_status": values.get("award_status", "") if len(tokens) == 1 else "",
@@ -392,6 +441,30 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
         if len(tokens) > 1 and values.get("rank"):
             issues.append(_issue("RANK_SCOPE_AMBIGUOUS", "同一名单包含多家企业，单个排名无法分配；排名留空", group, source_row=row))
         row_audit.append({**audit, "group_id": gid, "type": "business", "bidder_mentions": len(tokens)})
+    coverage_codes = {"BIDDER_LIST_AMBIGUOUS", "INVALID_COMPANY_NAME", "INVALID_BIDDER_COUNT"}
+    for group in groups.values():
+        if group["company_role"] != "bidder_name":
+            continue
+        reasons = []
+        for issue in issues:
+            if issue.get("group_id") != group["id"]:
+                continue
+            if issue["code"] in coverage_codes or (
+                    issue["code"] == "FIELD_UNAVAILABLE" and issue.get("field") == "bidder_name"):
+                reasons.append(issue["message"])
+        unique_records = {}
+        for record in group["records"]:
+            source_blocks = tuple(sorted({occurrence["source_block_id"] for occurrence in record["occurrences"]}))
+            unique_records.setdefault((source_blocks, name_key(record["name"]) or record["id"]), record)
+        actual_count = sum(bool(record["name"]) and not record["context_only"]
+                           for record in unique_records.values())
+        counts = set(group["counts"])
+        if len(counts) > 1 or (counts and counts != {actual_count}):
+            reasons.append("声明投标数量与整理后的企业数量不一致")
+        group["candidate_coverage"] = {
+            "complete": not reasons,
+            "reasons": list(dict.fromkeys(reasons)),
+        }
     return list(projects.values()), list(groups.values()), issues, row_audit
 
 
@@ -413,7 +486,8 @@ def finish_group(group: dict[str, Any], issues: list[dict[str, Any]], resolution
     # 采购方式是原文上下文，不覆盖明确中标事实，不独立制造数据复核。
     deduplicated = {}
     for record in group["records"]:
-        key = name_key(record["name"]) or record["id"]
+        source_blocks = tuple(sorted({occurrence["source_block_id"] for occurrence in record["occurrences"]}))
+        key = (source_blocks, name_key(record["name"]) or record["id"])
         previous = deduplicated.get(key)
         if previous:
             previous["occurrences"].extend(record["occurrences"])
@@ -421,6 +495,9 @@ def finish_group(group: dict[str, Any], issues: list[dict[str, Any]], resolution
         else:
             deduplicated[key] = record
     group["records"] = list(deduplicated.values())
+    group["source_block_ids"] = sorted({
+        occurrence["source_block_id"] for record in group["records"] for occurrence in record["occurrences"]
+    })
     for record in group["records"]:
         conflict_fields = []
         for field in ("bidder_price", "bidder_legal_person", "rank"):
@@ -452,10 +529,23 @@ def finish_group(group: dict[str, Any], issues: list[dict[str, Any]], resolution
                                  record_name=record["name"], conflicting_fields=sorted(set(conflict_fields))))
     counts = set(group["counts"])
     actual_count = sum(bool(record["name"]) and not record["context_only"] for record in group["records"])
-    if len(counts) > 1 or (counts and counts != {actual_count}):
+    count_mismatch = group["company_role"] == "bidder_name" and (
+        len(counts) > 1 or (counts and counts != {actual_count}))
+    if count_mismatch:
         issues.append(_issue("BIDDER_COUNT_MISMATCH", "声明投标数量与整理后的企业数量不一致", group,
                              declared_counts=sorted(counts), actual_count=actual_count))
-    matched, unresolved = match_group(group, resolutions)
+        group["candidate_coverage"]["complete"] = False
+        group["candidate_coverage"]["reasons"] = list(dict.fromkeys([
+            *group["candidate_coverage"]["reasons"], "声明投标数量与整理后的企业数量不一致",
+        ]))
+    if group["company_role"] == "bidder_name" and not group["candidate_coverage"]["complete"]:
+        issues.append(_issue(
+            "BIDDER_CANDIDATE_COVERAGE_INCOMPLETE",
+            "投标候选范围不完整，已停止项目关系消费和中标企业推荐",
+            group,
+            coverage_reasons=group["candidate_coverage"]["reasons"],
+        ))
+    matched, unresolved = match_group(group, resolutions, group["candidate_coverage"]["complete"])
     for problem in unresolved:
         details = dict(problem)
         issues.append(_issue(details.pop("code"), details.pop("message"), group, **details))
@@ -475,6 +565,8 @@ def finish_group(group: dict[str, Any], issues: list[dict[str, Any]], resolution
         completeness_reasons.append("本组没有中标结果")
     if incomplete:
         completeness_reasons.append("本组存在未解决的中标读取或对应问题")
+    if not group["candidate_coverage"]["complete"]:
+        completeness_reasons.append("本组投标候选范围不完整")
     group["award_completeness"] = {
         **declared_completeness,
         "verified": not completeness_reasons,
@@ -506,6 +598,10 @@ def _issue_identity(issue: dict[str, Any]) -> str:
         scope = ("field", issue.get("field"), issue.get("source_cell") or issue.get("source_row"))
     elif issue.get("award_cell") or issue.get("original_award"):
         scope = ("award", issue.get("award_cell"), issue.get("original_award"))
+    elif issue.get("standalone") and (issue.get("source_row") or issue.get("occurrence")):
+        occurrence = issue.get("occurrence") or {}
+        scope = ("standalone", issue.get("source_row") or occurrence.get("row"),
+                 tuple(sorted((occurrence.get("cells") or {}).items())))
     elif issue.get("record_name"):
         scope = ("record", issue.get("record_name"), tuple(issue.get("conflicting_fields", [])))
     elif issue.get("source_id") and not issue.get("group_id"):
@@ -671,6 +767,8 @@ def build_outputs(books: list[Workbook], plan: dict[str, Any], alias_payload: di
             audit_records.append({"id": record["id"], "final_sequence": sequence, "review_sequence": review_sequence,
                                   "project_id": project["id"], "group_id": group["id"], "source_id": source.source_id,
                                   "sheet": group["sheet"], "company_name": record["name"],
+                                  "table_kind": group["table_kind"], "company_role": group["company_role"],
+                                  "project_required": group["project_required"],
                                   "participation_type": "context" if record["context_only"] else
                                       (("award_company" if group["company_role"] == "award_name" else "bidder")
                                        if group["procurement_status"] == "bidding" else group["procurement_status"]),
@@ -707,6 +805,20 @@ def build_outputs(books: list[Workbook], plan: dict[str, Any], alias_payload: di
     for row in final:
         if name_key(row["公司名称"]):
             unique.setdefault(name_key(row["公司名称"]), row["公司名称"])
+    cross_block_names = {}
+    for record in audit_records:
+        if not record["company_name"] or not record["project_id"]:
+            continue
+        key = (record["project_id"], name_key(record["company_name"]))
+        cross_block_names.setdefault(key, set()).update(
+            occurrence["source_block_id"] for occurrence in record["occurrences"])
+    bidder_projectless = sum(
+        record["company_role"] == "bidder_name" and record["project_required"] and
+        bool(record["company_name"]) and record["project_id"] is None
+        for record in audit_records)
+    cross_block_deduplication = sum(
+        len({occurrence["source_block_id"] for occurrence in record["occurrences"]}) > 1
+        for record in audit_records)
     ledger = {
         "schema_version": 1, "parser_version": VERSION, "generated_at": timestamp,
         "sources": ([{"id": b.source_id, "file_name": b.path.name, "sha256": b.sha256, "size": b.size,
@@ -726,6 +838,13 @@ def build_outputs(books: list[Workbook], plan: dict[str, Any], alias_payload: di
             "review_record_count": len(review), "issue_count": len(issues), "unique_company_count": len(unique),
             "duplicate_mentions_removed": sum(len(r["occurrences"]) - 1 for r in audit_records),
             "corrected_record_count": sum(bool(r["corrections"]) for r in audit_records),
+            "bidder_roster_projectless_record_count": bidder_projectless,
+            "cross_block_duplicate_participation_count": sum(max(0, len(blocks) - 1)
+                                                               for blocks in cross_block_names.values()),
+            "cross_block_deduplication_count": cross_block_deduplication,
+            "incomplete_bidder_group_count": sum(
+                group["company_role"] == "bidder_name" and not group["candidate_coverage"]["complete"]
+                for group in groups),
         },
         "projects": projects, "groups": [{k: v for k, v in g.items() if k != "records"} for g in groups],
         "records": audit_records, "issues": issues, "row_audit": row_audit, "skipped_sheets": skipped,

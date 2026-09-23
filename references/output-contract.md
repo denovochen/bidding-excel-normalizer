@@ -14,6 +14,8 @@
 
 先按项目块、区域、标段和 group_context 分组。项目仅块首填写时按 blocks 继承；投标数量每行重复不能作为组起点；相同项目和标段的不同批次、轮次或表区必须保持不同组。匹配和去重只能发生在组内。
 
+每条 occurrence 保存稳定的 `source_block_id`。去重键至少包含来源投标块和企业规范名，因此同一企业参加不同标段或独立块时必须保留多条参与；`summary.cross_block_deduplication_count` 必须为0。映射了项目角色的 bidder roster 不允许发布 projectless 企业，`summary.bidder_roster_projectless_record_count` 必须为0。
+
 组内仅自动确认规范化后精确同名的投标企业，以及原表明确提供的中标状态。非精确名称不因 `row_aligned`、法人、金额、简称或相似度自动确认。
 
 非精确名称生成一个人工确认任务。安全的单企业同行结构优先推荐同行投标企业；否则按组内名称接近程度推荐。推荐只影响提问工具的第一选项，不改变中标状态。法人、报价、中标金额及单位继续保留在来源审计中，但不参与自动匹配或推荐排序，缺失时不产生匹配问题。
@@ -30,10 +32,14 @@
 
 ledger 保存 sources、mapping、matching_policy、projects/groups、records、issues、resolutions、row_audit、summary、unique_companies 和 CSV 哈希。启用跨表关系时还保存 relationships 与 relationship_resolutions。`groups.award_matches` 保存原中标名、单元格、推荐候选、人工选择、依据与状态；`occurrences.column_evidence` 保存上下文/辅助列。内部 ID 不是官方编号。
 
+新产物的覆盖摘要还包含 `cross_block_duplicate_participation_count`、`cross_block_deduplication_count`、`incomplete_bidder_group_count` 和 `bidder_roster_projectless_record_count`。候选范围不完整时 `award_matches.status=blocked`，不返回截断候选。旧 parser_version 的 plan 和产物继续按其原 summary 只读校验。
+
 `relationships` 必须包含可追溯的来源项目快照、目标项目、候选和组级链接。项目关系确定但标段范围不可靠时，相关记录只保留项目字段，标段字段为空，并由 `LOT_SCOPE_UNRESOLVED` 关联到 `review_queue.csv`；不能把项目级“否”解释为任何具体标段的未中标结论。
 
 真实单表范围或必须保留的结构超限属于文件级可恢复失败：整份文件记录为 `sources.status=unreadable`，保留文件名、哈希和包含 Sheet/触发位置/阈值的 error，并产生 `SOURCE_UNREADABLE` 独立复核行；其他来源继续处理，不交付该文件的截断数据。文件大小、解压规模、Sheet 数、有效单元格总数及结构展开规模限制仍为批次级错误。全部输入均可恢复失败时，允许发布仅有失败审计的三个产物，final.csv 只有表头，业务记录与企业数量为0；退出码0表示产物发布成功，不代表输入解析成功。
 
 unique_companies 从 final 非空公司名按 NFKC、去空白、casefold 去重，保持首次顺序并包含待复核名称；它不是已确认工商实体数。CSV 公式形文本加单引号并保存可恢复记录。发布前校验名称来源、组归属、置信度、表头、统计、哈希和复核关联。
+
+CSV 证据字段允许合法换行。记录数以标准 CSV parser 读取结果或 `ledger.summary.record_count/review_record_count` 为准，不能用物理文本行数减表头计算。
 
 1.7 增加跨表项目关系审计。关系只在 plan 显式声明时启用；旧 plan 继续使用原单表逻辑。项目名称不精确时只保存脚本提供的有界候选和结构化决定；不能通过中标企业反向选择项目。旧版结果仍可只读 validate，新结果不得覆盖原目录。

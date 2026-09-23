@@ -73,7 +73,7 @@ XLSX 有效内容由 OOXML 稀疏预扫描确定，空白样式不会产生业�
 | ignore | 明确无关列，必须写具体原因 |
 | unrecognized | 尚未识别；存在时禁止执行并继续返回 mapping_required |
 
-`columns` 可用角色：project_name/code/serial/year/owner、agent、lot_name/code、bidder_name/count/price/legal_person、award_name/status/price/legal_person、rank、notes。至少识别项目、标段或企业中的一项；不同角色不能映射同列。代理、实施主体和中标候选人不能当成投标企业。存在投标列时必须映射 bidder_name；只列中标企业时才仅映射 award_name。
+`columns` 可用角色：project_name/code/serial/year/owner、agent、lot_name/code、bidder_name/serial/count/price/legal_person、award_name/status/price/legal_person、rank、notes。至少识别项目、标段或企业中的一项；不同角色不能映射同列。代理、实施主体和中标候选人不能当成投标企业。存在投标列时必须映射 bidder_name；只列中标企业时才仅映射 award_name。投标企业块内序号映射为 `bidder_serial` 或作为 evidence，不能映射为 `project_serial`。
 
 所有非空行必须由表头、数据范围、`ignored_rows` 或 `review_regions` 覆盖，数据区间不能重叠。同 Sheet 混合结构拆为多个 tables。`structure_warnings` 中的新表头或结构变化必须通过拆区或复核区域消解后清空。补映射最多尝试两次；仍无可靠映射时将最小范围写入 `review_regions`，保留其他已确定结果。
 
@@ -91,7 +91,11 @@ XLSX 有效内容由 OOXML 稀疏预扫描确定，空白样式不会产生业�
 
 投标数量每行重复时不能作为 anchor。相同项目和标段存在不同批次、轮次或独立块时，优先把对应列设为 group_context；也可拆为多个 table。组 ID 包含区域边界，Python 只在组内匹配和去重。
 
+`project_mode=blocks` 同时适用于完整合并、部分合并提前结束和仅块首填写。若项目列为空，但已映射的 `lot_name`、`lot_code` 或 `notes` 在块首明确包含“项目/工程”文本，可在 plan 中设置 `project_context_fields`，例如 `"project_context_fields": ["lot_name"]`。Python 只消费直接块锚点中的明确项目文本，不把普通“一标段/二标段”改造成项目。映射了项目角色的 bidder roster 若仍出现非空企业且 `project_id=null`，执行将 fail-fast 返回局部证据。
+
 标段列只在块首填写、后续投标行留空时，不使用 `group_mode=lot` 逐行取值；应使用 `group_mode=anchor`，并把已映射的 `lot_name` 或 `lot_code` 设为 `group_start_field`。Python 保留块首标段值并将后续行归入同组。只有两侧标段都能可靠规范化时，跨表关系才细分到标段。
+
+投标数量只在 `company_role=bidder_name` 的投标名单组中用于“声明数量=整理企业数”核验。award-only 表可将该列映射为 `bidder_count` 以保留审计，也可降为 evidence；两种方式都不会用单条中标企业记录制造数量不一致。
 
 `bidder_separator` 可为 single、delimited 或 lines。名单顺序不是排名；联合体无法确认成员关系时进入复核。`award_mode=auto` 检查是否可安全把同行企业作为人工确认推荐项；`name_match` 明确只按组内名称推荐；`row_aligned` 表示区域已确认逐行对应，但非精确名称仍需用户选择。三种模式都只自动确认精确名称，并执行合并、名单、重复和跨行冲突检查。
 

@@ -81,7 +81,8 @@ def _task_id(group: dict, award: dict, entries: list[dict]) -> str:
     )
 
 
-def match_group(group: dict, resolutions: dict[str, dict] | None = None) -> tuple[set[str], list[dict]]:
+def match_group(group: dict, resolutions: dict[str, dict] | None = None,
+                candidate_coverage_complete: bool = True) -> tuple[set[str], list[dict]]:
     resolutions = resolutions or {}
     awards = {}
     for award in group["awards"]:
@@ -97,6 +98,23 @@ def match_group(group: dict, resolutions: dict[str, dict] | None = None) -> tupl
             "exact": [candidate for candidate in candidates if name_key(candidate["name"]) == name_key(award["name"])],
             "review_task_id": _task_id(group, award, entries),
         })
+    if not candidate_coverage_complete:
+        group["award_matching"] = {
+            "mode": "group_match",
+            "reason": "投标候选范围不完整，停止名称对应和候选推荐",
+            "row_recommendation": {"safe": False, "reason": "投标候选范围不完整"},
+        }
+        group["award_matches"] = [{
+            "original_award": case["award"]["raw"],
+            "award_cells": [entry["cell"] for entry in case["entries"]],
+            "status": "blocked", "basis": "candidate_coverage_incomplete",
+            "selected_record_id": None, "selected_bidder_name": None,
+            "candidate_count": 0, "candidates": [], "review_task_id": None,
+            "recommended_record_id": None, "recommended_bidder_name": None,
+            "recommendation_basis": "blocked", "recommendation_reason": "投标候选范围不完整",
+            "resolution": None,
+        } for case in cases]
+        return set(), []
     row_recommendation = _row_recommendation(group, cases)
     group["award_matching"] = {
         "mode": "group_match",

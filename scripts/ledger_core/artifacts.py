@@ -202,6 +202,42 @@ def validate_outputs(output: Path) -> dict[str, Any]:
         "duplicate_mentions_removed": sum(len(r["occurrences"]) - 1 for r in records),
         "corrected_record_count": sum(bool(r["corrections"]) for r in records),
     }
+    if ledger.get("parser_version") == VERSION:
+        for group in groups.values():
+            coverage = group.get("candidate_coverage")
+            if (group.get("company_role") == "bidder_name" and
+                    (not isinstance(coverage, dict) or type(coverage.get("complete")) is not bool or
+                     not isinstance(coverage.get("reasons"), list))):
+                raise LedgerError("投标候选覆盖审计无效")
+        bidder_projectless = sum(
+            record.get("company_role") == "bidder_name" and record.get("project_required") and
+            bool(record["company_name"]) and record["project_id"] is None
+            for record in records)
+        cross_block_names = {}
+        cross_block_deduplication = 0
+        for record in records:
+            source_blocks = {occurrence.get("source_block_id") for occurrence in record["occurrences"]}
+            if None in source_blocks:
+                raise LedgerError("记录缺少来源投标块审计")
+            if len(source_blocks) > 1:
+                cross_block_deduplication += 1
+            if record["project_id"] and record["company_name"]:
+                cross_block_names.setdefault((record["project_id"], name_key(record["company_name"])), set()).update(
+                    source_blocks)
+        expected_counts.update({
+            "bidder_roster_projectless_record_count": bidder_projectless,
+            "cross_block_duplicate_participation_count": sum(max(0, len(blocks) - 1)
+                                                               for blocks in cross_block_names.values()),
+            "cross_block_deduplication_count": cross_block_deduplication,
+            "incomplete_bidder_group_count": sum(
+                group.get("company_role") == "bidder_name" and
+                not group.get("candidate_coverage", {}).get("complete", True)
+                for group in groups.values()),
+        })
+        if bidder_projectless:
+            raise LedgerError("bidder roster 存在无项目归属记录")
+        if cross_block_deduplication:
+            raise LedgerError("检测到跨来源投标块去重")
     if "relationships" in ledger:
         relationships = ledger["relationships"]
         expected_counts.update({
@@ -286,7 +322,7 @@ def _validate_award_matches(ledger: dict) -> None:
             raise LedgerError("中标完整性审计无效")
         selected_ids = set()
         for match in group["award_matches"]:
-            if match["status"] not in {"matched", "unresolved", "conflict"}:
+            if match["status"] not in {"matched", "unresolved", "conflict", "blocked"}:
                 raise LedgerError("中标对应状态无效")
             if not match["award_cells"] or any(cell not in {a["cell"] for a in group["awards"]} for cell in match["award_cells"]):
                 raise LedgerError("中标对应缺少原始单元格")

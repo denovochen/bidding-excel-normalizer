@@ -1,6 +1,6 @@
 # bidding-excel-normalizer
 
-独立的招投标 Excel 整理 Skill，当前版本 **1.7.0**。输入 XLS/XLSX，支持陌生结构映射、跨 Sheet 项目关系、项目候选复核和非精确中标名称确认，最终交付 final.csv、review_queue.csv、ledger.json。
+独立的招投标 Excel 整理 Skill，当前版本 **1.7.1**。输入 XLS/XLSX，支持陌生结构映射、跨 Sheet 项目关系、项目候选复核和非精确中标名称确认，最终交付 final.csv、review_queue.csv、ledger.json。
 
 脚本全量扫描、分组、清洗、关联项目、对应中标记录并校验；模型轻量审阅结构并只编写 plan patch 或选择有界项目候选，不逐行判断企业名称。存在投标列时，最终公司名称始终来自投标列；中标栏仅用于对应结果与审计，不替换、纠正投标全称。
 
@@ -41,6 +41,8 @@ python scripts/excel_ledger.py resolve --state <state.json> --answers <answers.j
 投标栏自身的错字、重复地名或异常公司后缀会保留；只清理格式和完整企业后缀后的“投标”附注。纯中标名单继续按 award_company 角色保留。unique_companies 是去重文本名称集合，不能称为已确认的企业实体数量。
 
 1.7 增加标准表类型、项目名称主导的跨 Sheet 关系、标段可选细分、项目关系候选复核、紧凑 inspection、plan patch 和依赖预检。旧 plan 未声明 relationships 时继续执行 1.6 单表逻辑；旧版本产物仍可 validate。本仓库尚未接入 Spider 或报告服务，修改代码不等于已部署到 QM/Qwen。
+
+1.7.1 增加 bidder roster 项目覆盖不变量、部分合并/块首项目继承、`bidder_serial`、来源投标块审计及跨块去重保护。映射了项目角色的投标企业若仍无法归属项目，将返回 `mapping_required`，不会进入跨表关系、中标候选或最终发布。候选范围不完整时关系和中标推荐均停止，award-only 表的投标数量只保留为证据。CSV 记录数始终由 CSV 解析器或 `ledger.summary` 返回，不按物理文本行统计。
 
 原始业务 Excel、处理结果、缓存和凭据不提交。tests/verify_samples.py 从仓库外读取真实样本，仓库不附带业务数据。
 

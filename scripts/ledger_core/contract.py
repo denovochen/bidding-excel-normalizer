@@ -7,7 +7,7 @@ import re
 import unicodedata
 from datetime import datetime
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 FIELDS = [
     "序号", "项目名称", "项目编号", "标段名称", "标段编号", "公司名称", "中标与否", "投标排名",
     "文件类别", "依据文件路径", "来源页码", "提取方式", "证据文本", "置信度", "复核状态", "解析结果生成日期时间",
@@ -15,7 +15,7 @@ FIELDS = [
 OUTPUTS = {"final.csv", "review_queue.csv", "ledger.json"}
 ROLES = {
     "project_name", "project_code", "project_serial", "project_year", "project_owner", "agent",
-    "lot_name", "lot_code", "bidder_name", "bidder_count", "bidder_price", "bidder_legal_person",
+    "lot_name", "lot_code", "bidder_name", "bidder_serial", "bidder_count", "bidder_price", "bidder_legal_person",
     "award_name", "award_status", "award_price", "award_legal_person", "rank", "notes",
 }
 BUSINESS_ROLES = {"project_name", "project_code", "lot_name", "lot_code", "bidder_name", "award_name"}

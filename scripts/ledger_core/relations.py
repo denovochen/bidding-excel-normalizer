@@ -218,6 +218,13 @@ def _project_level_group(relation_id: str, target_project: dict[str, Any], sourc
         "group_mode": "project",
         "group_context": {},
         "group_context_cells": {},
+        "source_block_ids": sorted({block_id for item in target_groups
+                                    for block_id in item.get("source_block_ids", [item["id"]])}),
+        "candidate_coverage": {
+            "complete": all(item.get("candidate_coverage", {}).get("complete", True) for item in target_groups),
+            "reasons": list(dict.fromkeys(reason for item in target_groups
+                                           for reason in item.get("candidate_coverage", {}).get("reasons", []))),
+        },
     })
     for target in target_groups:
         for record in target["records"]:
@@ -371,7 +378,22 @@ def apply_relationships(projects: list[dict[str, Any]], groups: list[dict[str, A
                     "cells": dict(source.get("cells", {})),
                 },
             }
-            if selected:
+            blocked_groups = ([group for group in groups_by_project[selected["id"]]
+                               if not group.get("candidate_coverage", {}).get("complete", True)]
+                              if selected else [])
+            if selected and blocked_groups:
+                audit["status"] = "blocked"
+                audit["basis"] = "candidate_coverage_incomplete"
+                audit["coverage_blocked_group_ids"] = [group["id"] for group in blocked_groups]
+                for group in blocked_groups:
+                    issues.append(_issue(
+                        "PROJECT_RELATION_COVERAGE_INCOMPLETE",
+                        "投标候选范围不完整，已停止跨表项目关系消费和中标企业推荐",
+                        group["id"], source_project_id=source["id"], target_project_id=selected["id"],
+                        coverage_reasons=group.get("candidate_coverage", {}).get("reasons", []),
+                    ))
+                group_redirects.update({group["id"]: None for group in groups_by_project[source["id"]]})
+            elif selected:
                 target_groups_for_project = groups_by_project[selected["id"]]
                 fallback, redirects = _apply_project_relation(
                     source, selected, groups_by_project[source["id"]], target_groups_for_project, issues, audit)
