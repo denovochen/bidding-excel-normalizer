@@ -41,7 +41,7 @@ class AwardReviewWorkflowTests(unittest.TestCase):
         }
         return book, plan, build_outputs([book], plan)
 
-    def test_questions_are_batched_and_keep_the_minimal_three_paths(self):
+    def test_tied_candidates_stay_batched_without_a_default_recommendation(self):
         rows = [["项目名称", "投标企业名单", "中标单位"]]
         rows.extend([[f"项目{index}", f"企业{index}甲公司、企业{index}乙公司", f"旧企业{index}"]
                      for index in range(1, 7)])
@@ -49,13 +49,29 @@ class AwardReviewWorkflowTests(unittest.TestCase):
         questions, total, remaining = pending_questions(prepared[2], {})
         self.assertEqual((total, remaining, len(questions)), (6, 6, 5))
         for question in questions:
-            self.assertEqual(len(question["options"]), 2)
-            self.assertTrue(question["options"][0]["label"].endswith(" (Recommended)"))
-            self.assertEqual(question["options"][1], {"label": "不确定", "value": "unresolved"})
+            self.assertEqual(len(question["options"]), 3)
+            self.assertFalse(any("Recommended" in option["label"] for option in question["options"]))
+            self.assertEqual(question["options"][0], {"label": "不确定", "value": "unresolved"})
             self.assertTrue(question["allow_other"])
             self.assertFalse(question["multi_select"])
             self.assertNotIn("法人", question["question"])
             self.assertNotIn("金额", question["question"])
+
+    def test_tied_candidate_can_still_be_selected_and_published(self):
+        book, plan, prepared = self.build([
+            ["项目名称", "投标企业名单", "中标单位"],
+            ["测试工程", "新甲建设有限公司、新乙建设有限公司", "新丙建设有限公司"],
+        ])
+        match = prepared[2]["groups"][0]["award_matches"][0]
+        self.assertIsNone(match["recommended_record_id"])
+        question = pending_questions(prepared[2], {})[0][0]
+        state = {"decisions": {}}
+        selected = question["options"][2]["value"]
+        self.assertFalse(apply_answers(state, prepared[2], {question["question_id"]: selected}))
+        final, review, ledger = build_outputs([book], plan, award_resolutions=state["decisions"])
+        self.assertEqual(sum(row["中标与否"] == "是" for row in final), 1)
+        self.assertFalse(review)
+        self.assertFalse(ledger["resolutions"][0]["actor_verified"])
 
     def test_other_text_selects_a_unique_bidder_and_python_rebuilds_results(self):
         book, plan, prepared = self.build([

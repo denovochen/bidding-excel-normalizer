@@ -10,6 +10,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from collections import Counter
 
 from .contract import FIELDS, OUTPUTS, VERSION, LedgerError, name_key
 
@@ -20,6 +21,27 @@ def digest(path: Path) -> str:
         while block := stream.read(1024 * 1024):
             h.update(block)
     return h.hexdigest()
+
+
+def delivery_summary(ledger: dict) -> dict:
+    grouped = {}
+    for issue in ledger["issues"]:
+        item = grouped.setdefault(issue["code"], {"code": issue["code"], "message": issue["message"],
+                                                 "issue_count": 0, "review_sequences": set()})
+        item["issue_count"] += 1
+        item["review_sequences"].update(issue.get("review_sequences", []))
+    reasons = [{"code": item["code"], "message": item["message"], "issue_count": item["issue_count"],
+                "affected_review_records": len(item["review_sequences"])} for item in grouped.values()]
+    counts = ledger["summary"]
+    awards = Counter(item["decision"] for item in ledger.get("resolutions", []))
+    warning_count = len(ledger.get("audit_warnings", []))
+    message = (f"已生成 {counts['record_count']} 条标准记录、{counts['review_record_count']} 条复核队列记录。"
+               f"复核原因共 {counts['issue_count']} 项；辅助审计提示 {warning_count} 条，单独保存，不与队列相加。"
+               f"中标名称决定：选定 {awards['select_bidder']} 项、暂缓 {awards['deferred']} 项。"
+               "产物一致性与来源校验不代表业务全部确认。")
+    return {"message": message, "review_reasons": reasons,
+            "reason_counts_may_overlap": True, "audit_warning_count": warning_count,
+            "award_decisions": dict(awards), "company_count_meaning": "去重名称文本数量，未验证企业实体身份"}
 
 
 def _write_csv(path: Path, rows: list[dict]) -> list[dict[str, Any]]:
@@ -273,14 +295,15 @@ def validate_outputs(output: Path) -> dict[str, Any]:
             if not relation or resolution.get("decision") not in {"select_project", "deferred"}:
                 raise LedgerError("项目关系决定缺少对应任务")
             if resolution["decision"] == "select_project":
-                if (relation["status"] != "matched" or relation["basis"] != "user_selection" or
+                expected_basis = "model_selection" if resolution.get("actor") == "model" else "user_selection"
+                if (relation["status"] != "matched" or relation["basis"] != expected_basis or
                         relation["target_project_id"] != resolution.get("project_id")):
                     raise LedgerError("项目关系人工选择未正确应用")
             elif relation["status"] == "matched":
                 raise LedgerError("标记不确定的项目关系不得自动匹配")
     if ledger["summary"] != expected_counts:
         raise LedgerError("summary 与明细计数不一致")
-    return {"validated": True, "summary": expected_counts,
+    return {"validated": True, "summary": expected_counts, "delivery": delivery_summary(ledger),
             "checks": {"artifact_consistency": "passed",
                        "source_accounting": "passed" if "source_coverage" in ledger else "not_available_legacy",
                        "review_queue": "has_pending_items" if review else "empty",

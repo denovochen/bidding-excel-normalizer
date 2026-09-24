@@ -4,7 +4,7 @@
 
 每个问题代表一组表头结构相同的区域，`regions` 列出来源，`columns` 给出列头、少量样例和候选角色。确认语义适用于所列区域后才接受。需要补证据时用 `inspect_command`，无法解释就按 `review_answer` 留待复核。
 
-保存 question_id 到答案的 JSON 对象，使用返回的 answer_template。例如：
+填写返回的 `answer_file`，保留批次外壳；下面示例是其 `answers` 成员。模板已由程序写入该文件。问题摘要不足时使用 `detail_command` 的字段索引查看 columns、project_context_candidates 等证据：
 
 ```json
 {
@@ -38,7 +38,7 @@
 
 无项目字段值时，像“东片”这样的任意块名不能自动继承项目。若确认它确实是当前项目的标段，将对应列放入 `lot_context_columns`；若是新项目则放入 `project_context_columns`，两者不能重叠。项目来源采用原文，不要求原文必须包含“项目/工程”关键字。遇到明确项目文本冲突仍会阻断。
 
-宽表摘要可能标记 `column_profiles_compacted`，完整表头和样例通过 `inspect_command --columns A:P` 分页查看。不能把未查看的陌生列批量当作 evidence。
+宽表问题可通过 `question --section columns` 分页，必要时用问题索引中的 `inspect_command --columns A:P` 查看原始行。不能把未查看的陌生列批量当作 evidence。
 
 `award_completeness` 为 complete、partial 或 unknown。complete 必须有区域列出最终全部中标结果的依据；有中标列不等于完整。投标名册本身没有结果时设 unknown。award-only 的投标数量仅供审计。
 

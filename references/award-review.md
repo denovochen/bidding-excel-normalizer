@@ -10,17 +10,15 @@
 ask_user_question({"questions": result.questions})
 ```
 
-每个问题只提供三条交互路径：
+有唯一推荐时保留以下交互路径：
 
 1. Python 推荐的投标企业，标签以 `(Recommended)` 结尾，值为稳定 `record_id`。
 2. “不确定”，值为 `unresolved`。
 3. 工具的 Other 输入框，允许用户输入企业名称。
 
-脚本每批最多返回5个问题。工具返回后，将 `answer` 对象原样保存为 state 同目录的 `answers.json`；不要把答案改写成公司别名或自行替用户选择。执行：
+名称评分并列时不设置推荐项，问题保留少量有界候选和“不确定”，不确定排在首项；候选排序不代表证据更强。支持不预选的宿主应不预选，始终等待真实用户提交。超预算问题标记 `details_required` 时，先按字段分页取得原始 question/options，再展示，不能让用户回答仅含索引的问题。
 
-```bash
-python scripts/excel_ledger.py resolve --state <state.json完整路径> --answers <answers.json完整路径>
-```
+每批最多5个问题，平台响应可能按预算进一步缩小批次。工具返回后，将答案对象保存到返回的 `answer_file.answers`，保留 batch_id/state_version；不要改写公司别名或替用户选择。执行返回的 `next_command`。不累计历史答案。
 
 - 再次返回 `award_review_required`：继续调用提问工具。`validation_errors` 非空时，简短说明对应输入未唯一匹配当前组，然后重问返回的问题。
 - 返回 `result`：只交付最终三个文件。

@@ -31,7 +31,7 @@ def _award_tasks(ledger: dict[str, Any]) -> list[dict[str, Any]]:
         if not task_id or not group or issue["code"] not in {"AWARD_NAME_MISMATCH", "AWARD_MATCH_CONFLICT"}:
             continue
         match = next((item for item in group["award_matches"] if item.get("review_task_id") == task_id), None)
-        if not match or not match.get("recommended_record_id") or not match.get("recommended_bidder_name"):
+        if not match or not match.get("candidates"):
             continue
         project = projects.get(group.get("project_id"), {"values": {}})
         project_name = clean(project.get("values", {}).get("project_name")) or clean(
@@ -50,7 +50,15 @@ def _award_tasks(ledger: dict[str, Any]) -> list[dict[str, Any]]:
                     award_locations.append(origin)
         question = (f"项目：{project_name}\n招标范围：{scope}\n投标来源：{location}\n"
                     f"中标来源：{'; '.join(award_locations)}\n"
-                    f"原中标企业：{match['original_award']}\n\n请选择对应的投标企业")
+                    f"原中标企业：{match['original_award']}\n"
+                    f"候选依据：{match['recommendation_reason']}\n\n请选择对应的投标企业")
+        options = [{"label": "不确定", "value": "unresolved"}]
+        if match.get("recommended_record_id"):
+            options.insert(0, {"label": match["recommended_bidder_name"] + " (Recommended)",
+                               "value": match["recommended_record_id"]})
+        else:
+            options.extend({"label": candidate["name"], "value": candidate["record_id"]}
+                           for candidate in match["candidates"])
         tasks.append({
             "task_type": "award",
             "review_task_id": task_id,
@@ -67,11 +75,7 @@ def _award_tasks(ledger: dict[str, Any]) -> list[dict[str, Any]]:
             "question": {
                 "question_id": task_id,
                 "question": question,
-                "options": [
-                    {"label": match["recommended_bidder_name"] + " (Recommended)",
-                     "value": match["recommended_record_id"]},
-                    {"label": "不确定", "value": "unresolved"},
-                ],
+                "options": options,
                 "multi_select": False,
                 "allow_other": True,
             },
@@ -89,14 +93,19 @@ def _relation_tasks(ledger: dict[str, Any]) -> list[dict[str, Any]]:
         if relation.get("status") in {"matched", "blocked"} or not task_id or not candidates:
             continue
         issue = issues.get(task_id, {})
+        selectable = [candidate for candidate in candidates if not candidate.get("selection_blockers")]
+        if not selectable:
+            continue
         options = [{
             "label": f"{candidate['project_name']}（{candidate['sheet']}）",
             "value": candidate["project_id"],
-        } for candidate in candidates]
+        } for candidate in selectable]
         options.append({"label": "不确定", "value": "unresolved"})
         evidence = "\n".join(
-            f"{index}. {candidate['project_name']}：{'；'.join(candidate['evidence'])}"
+            f"{index}. {candidate['project_name']}：{'；'.join(candidate['evidence'] + candidate.get('selection_blockers', []))}"
             for index, candidate in enumerate(candidates, 1))
+        source = relation["source_project"]
+        source_cell = f"{source['sheet']}!{source['cells'].get('project_name') or source['cells'].get('project_code', '')}"
         tasks.append({
             "task_type": "relation", "review_task_id": task_id,
             "issue_id": issue.get("id"), "source_project_id": relation["source_project_id"],
@@ -106,6 +115,9 @@ def _relation_tasks(ledger: dict[str, Any]) -> list[dict[str, Any]]:
                 "question": (f"中标汇总项目：{relation['source_project_name']}\n\n候选依据：\n{evidence}"
                              "\n\n请选择对应的投标明细项目；不能可靠确认时选择不确定。"),
                 "options": options, "multi_select": False, "allow_other": False,
+                "evidence_refs": {candidate["project_id"]: [source_cell, candidate["source_cell"]]
+                                  for candidate in selectable},
+                "answer_template": {"value": "unresolved", "basis": "", "evidence": []},
             },
         })
     return sorted(tasks, key=lambda task: (task["source_project_name"], task["review_task_id"]))
@@ -232,17 +244,28 @@ def apply_answers(state: dict[str, Any], ledger: dict[str, Any], answers: dict[s
             errors.append({"question_id": task_id, "message": str(exc)})
             continue
         if name_key(value) in {name_key(item) for item in DEFERRED_VALUES}:
-            decisions[task_id] = {"decision": "deferred", "decided_at": _timestamp()}
+            decisions[task_id] = {"decision": "deferred", "decided_at": _timestamp(),
+                                  "actor": "model" if task["task_type"] == "relation" else "user"}
+            if task["task_type"] == "award":
+                decisions[task_id].update(actor_verified=False,
+                    confirmation_provenance="local_answer_file_not_host_verified")
             continue
         if task["task_type"] == "relation":
             candidate = next((item for item in task["candidates"] if item["project_id"] == value), None)
             if not candidate:
                 errors.append({"question_id": task_id, "message": "所选项目不属于当前关系候选"})
                 continue
+            if candidate.get("selection_blockers"):
+                errors.append({"question_id": task_id, "message": "；".join(candidate["selection_blockers"])})
+                continue
             decisions[task_id] = {
                 "decision": "select_project", "project_id": candidate["project_id"],
                 "project_name": candidate["project_name"], "decided_at": _timestamp(),
+                "actor": "model", "evidence": candidate["evidence"],
             }
+            if isinstance(answer, dict):
+                decisions[task_id]["basis"] = answer.get("basis", "")
+                decisions[task_id]["evidence_refs"] = answer.get("evidence", [])
             continue
         group_records = records_by_group.get(task["group_id"], [])
         selected = next((record for record in group_records if record["id"] == value), None)
@@ -265,6 +288,7 @@ def apply_answers(state: dict[str, Any], ledger: dict[str, Any], answers: dict[s
             "source": source,
             "decided_at": _timestamp(),
             "confirmation_provenance": "local_answer_file_not_host_verified",
+            "actor": "user", "actor_verified": False,
         }
         if source == "manual":
             decision["user_input"] = value

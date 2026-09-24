@@ -328,10 +328,11 @@ def handoff(state: dict, books) -> dict:
             break
         selected.append(question)
     result = {"kind": "mapping_required", "stage": "structure", "state": state["state_path"],
-              "remaining_task_count": remaining, "questions": selected,
-              "message": "只返回 question_id 到结构语义答案的 JSON；保留有依据的建议，未知列必须解释。无需读取源码或编写 plan。",
+              "remaining_task_count": remaining,
               "answer_roles": sorted(ROLES | {"evidence", "group_context"}),
-              "next_command": command("resolve", state=state["state_path"], answers=Path(state["state_path"]).with_name("answers.json"))}
+              "next_command": command("resolve", state=state["state_path"], answers=Path(state["state_path"]).with_name("answers.json")),
+              "message": "只返回 question_id 到结构语义答案的 JSON；保留有依据的建议，未知列必须解释。无需读取源码或编写 plan。",
+              "questions": selected}
     state["issued_questions"] = [question["question_id"] for question in selected]
     save_state(Path(state["state_path"]), state)
     return result

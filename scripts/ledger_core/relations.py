@@ -90,10 +90,60 @@ def _candidate_evidence(source: dict[str, Any], target: dict[str, Any], score: f
     return evidence
 
 
-def _rank_candidates(source: dict[str, Any], targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def selection_blockers(source: dict[str, Any], target: dict[str, Any], peers: list[dict[str, Any]]) -> list[str]:
+    """Only explicit identity conflicts block selection; missing fields are not conflicts."""
+    left, right = source.get("values", {}), target.get("values", {})
+    a, b = clean(left.get("project_name")), clean(right.get("project_name"))
+    reasons = []
+    for field, label, normalize in (("project_code", "项目编号", name_key),
+                                     ("project_year", "年度", project_year)):
+        av = normalize(left.get(field) or (a if field == "project_year" else ""))
+        bv = normalize(right.get(field) or (b if field == "project_year" else ""))
+        if av and bv and av != bv:
+            reasons.append(label + "冲突")
+    extension = re.compile(r"增做|追加工程|新增工程|节余资金|结余资金")
+    if bool(extension.search(a)) != bool(extension.search(b)):
+        reasons.append("主工程与追加/节余资金工程范围不能直接等同")
+    locality = re.compile(r"([^省市县区年度\d（）()，,\s]{1,12}(?:镇|街道))")
+    places = [list(locality.finditer(value)) for value in (a, b)]
+    if all(len(matches) == 1 for matches in places):
+        if places[0][0].group(0) != places[1][0].group(0):
+            reasons.append("乡镇/街道冲突")
+        else:
+            areas = [re.match(r"([\u4e00-\u9fff]{1,10}?(?:村|片))", value[matches[0].end():])
+                     for value, matches in zip((a, b), places)]
+            if all(areas) and areas[0].group(0) != areas[1].group(0):
+                reasons.append("村/片区冲突")
+    funding = ("增发国债", "国家专项债", "财政补助")
+    av, bv = {token for token in funding if token in a}, {token for token in funding if token in b}
+    if av and bv and not av.intersection(bv):
+        reasons.append("资金来源冲突")
+    kinds = [{label for pattern, label in ((r"改造|提升", "改造"), (r"新建|新增建设", "新建"))
+              if re.search(pattern, value)} for value in (a, b)]
+    if all(kinds) and not kinds[0].intersection(kinds[1]):
+        reasons.append("建设类型冲突")
+    same_name = [peer for peer in peers if project_name_key(_project_label(peer)) == project_name_key(b)
+                 and project_year(peer.get("values", {}).get("project_year") or _project_label(peer)) ==
+                 project_year(right.get("project_year") or b)]
+    if len(same_name) > 1:
+        # A source row address distinguishes candidates, but does not identify which one the summary means.
+        discriminators = [field for field in ("project_code", "project_owner") if clean(left.get(field))]
+        unique = any(name_key(left[field]) == name_key(right.get(field)) and
+                     sum(name_key(peer.get("values", {}).get(field)) == name_key(left[field])
+                         for peer in same_name) == 1 for field in discriminators)
+        if not unique:
+            reasons.append("同名同年度候选有多个独立来源，缺少唯一项目编号或实施主体依据")
+    return reasons
+
+
+def _rank_candidates(source: dict[str, Any], targets: list[dict[str, Any]],
+                     peers: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     source_values = source.get("values", {})
     source_year = project_year(source_values.get("project_year") or source_values.get("project_name"))
     result = []
+    peers_by_name = defaultdict(list)
+    for peer in peers if peers is not None else targets:
+        peers_by_name[project_name_key(_project_label(peer))].append(peer)
     for target in targets:
         target_year = project_year(
             target.get("values", {}).get("project_year") or target.get("values", {}).get("project_name"))
@@ -105,13 +155,16 @@ def _rank_candidates(source: dict[str, Any], targets: list[dict[str, Any]]) -> l
             "project_year": clean(target.get("values", {}).get("project_year")),
             "sheet": target["sheet"],
             "table_id": target["table_id"],
+            "source_cell": f"{target['sheet']}!{target.get('cells', {}).get('project_name') or target.get('cells', {}).get('project_code', '')}",
             "name_similarity": round(score, 6),
             "year_match": source_year == target_year if source_year and target_year else None,
+            "selection_blockers": selection_blockers(source, target, peers_by_name[project_name_key(_project_label(target))]),
             "evidence": _candidate_evidence(source, target, score),
         })
     return sorted(result, key=lambda item: (
-        -item["name_similarity"],
+        bool(item["selection_blockers"]),
         -int(item["year_match"] is True),
+        -item["name_similarity"],
         item["project_id"],
     ))[:5]
 
@@ -367,15 +420,18 @@ def apply_relationships(projects: list[dict[str, Any]], groups: list[dict[str, A
             eligible_targets = [project for project in target_projects if all(
                 group.get("candidate_coverage", {}).get("complete", True)
                 for group in groups_by_project[project["id"]])]
-            ranked = _rank_candidates(source, eligible_targets)
+            exact_ids = {project["id"] for project in exact}
+            ranked = _rank_candidates(source, [project for project in eligible_targets
+                                               if not exact_ids or project["id"] in exact_ids], target_projects)
             decision = resolutions.get(task_id)
-            selected = exact[0] if len(exact) == 1 else None
+            selected = exact[0] if len(exact) == 1 and not selection_blockers(source, exact[0], target_projects) else None
             basis = "exact_project_key" if selected else "unresolved"
             if not selected and decision and decision.get("decision") == "select_project":
                 selected = next((project for project in eligible_targets
                                  if project["id"] == decision.get("project_id") and
-                                 project["id"] in {item["project_id"] for item in ranked}), None)
-                basis = "user_selection" if selected else "invalid_resolution"
+                                 project["id"] in {item["project_id"] for item in ranked
+                                                   if not item["selection_blockers"]}), None)
+                basis = ("model_selection" if decision.get("actor") == "model" else "user_selection") if selected else "invalid_resolution"
             audit = {
                 "id": stable_id("project_relation", relation_id, source["id"]),
                 "relation_id": relation_id, "kind": RELATION_KIND,

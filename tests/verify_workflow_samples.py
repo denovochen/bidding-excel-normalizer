@@ -36,32 +36,63 @@ def semantic_fixture(question: dict) -> dict:
     return answer
 
 
-def verify(path: Path, destination: Path, kind: str) -> dict:
+def verify(path: Path, destination: Path, kind: str, agent_mode: bool = False) -> dict:
     before = hashlib.sha256(path.read_bytes()).hexdigest()
-    command = [sys.executable, "-B", str(ROOT / "scripts/excel_ledger.py"), "run", str(path),
+    entry = ROOT / ("scripts/excel_agent.py" if agent_mode else "scripts/excel_ledger.py")
+    command = [sys.executable, "-B", str(entry), "run", str(path),
                "--output", str(destination)]
     totals = {"cli_calls": 0, "response_characters": 0, "largest_response_characters": 0,
               "structure_questions": 0, "table_relationship_questions": 0,
               "project_questions": 0, "deferred_award_questions": 0}
     call_log = []
     started = time.monotonic()
-    while totals["cli_calls"] < 30:
-        process = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=120)
+
+    def invoke(args):
+        process = subprocess.run(args, cwd=ROOT, capture_output=True, text=True, timeout=120)
         if process.returncode not in {0, 3, 4, 5}:
             raise AssertionError(process.stderr + process.stdout)
+        if agent_mode and (process.returncode != 0 or len(process.stdout.rstrip("\n")) > 6000):
+            raise AssertionError("平台入口未遵守成功交接或响应预算")
         reply = json.loads(process.stdout)
         totals["cli_calls"] += 1
         totals["response_characters"] += len(process.stdout)
         totals["largest_response_characters"] = max(totals["largest_response_characters"], len(process.stdout))
         call_log.append({"kind": reply["kind"], "exit_code": process.returncode,
                          "response_characters": len(process.stdout)})
+        return reply
+
+    def detail(reply, question, section):
+        collected, offset = [], 0
+        while True:
+            page = invoke([sys.executable, "-B", str(entry), "question", "--state", reply["state"],
+                           "--id", question["question_id"], "--section", section, "--offset", str(offset)])
+            collected.extend(page["items"])
+            offset += len(page["items"])
+            if not page["next_command"]:
+                return collected
+
+    while totals["cli_calls"] < 100:
+        reply = invoke(command)
         if reply["kind"] == "result":
             break
         if reply.get("validation_errors"):
             raise AssertionError(reply["validation_errors"])
         answers = {}
+        envelope = json.loads(Path(reply["answer_file"]).read_text(encoding="utf-8")) if agent_mode else None
         for question in reply["questions"]:
             key = question["question_id"]
+            if agent_mode:
+                question = dict(question)
+                if reply["kind"] == "mapping_required":
+                    question["task_type"] = detail(reply, question, "task_type")[0]
+                    question["answer_template"] = envelope["answers"][key]
+                    sections = (["columns", "project_context_candidates"] if question["task_type"] == "structure"
+                                else ["candidate_bidder_sets", "sources"])
+                    for section in sections:
+                        if section not in question:
+                            question[section] = detail(reply, question, section)
+                elif "options" not in question:
+                    question["options"] = detail(reply, question, "options")
             if question.get("task_type") == "structure":
                 if question.get("previous_error"):
                     raise AssertionError(question["previous_error"])
@@ -75,7 +106,14 @@ def verify(path: Path, destination: Path, kind: str) -> dict:
                                 "basis": "样本夹具语义：施工结果关联施工投标名册，其他专业独立保留"}
             elif reply["kind"] == "relationship_review_required":
                 totals["project_questions"] += 1
-                answers[key] = question["options"][0]["value"]
+                selected = question["options"][0]["value"]
+                if agent_mode and selected != "unresolved":
+                    if "evidence_refs" not in question:
+                        question["evidence_refs"] = {item["key"]: item["value"] for item in detail(reply, question, "evidence_refs")}
+                    answers[key] = {"value": selected, "basis": "测试夹具模拟候选选择，非业务真值验收",
+                                    "evidence": question["evidence_refs"][selected]}
+                else:
+                    answers[key] = selected
             elif reply["kind"] == "award_review_required":
                 totals["deferred_award_questions"] += 1
                 answers[key] = "unresolved"
@@ -83,9 +121,11 @@ def verify(path: Path, destination: Path, kind: str) -> dict:
                 raise AssertionError("未知交接类型")
         command = shlex.split(reply["next_command"])
         answers_path = Path(command[command.index("--answers") + 1])
-        answers_path.write_text(json.dumps(answers, ensure_ascii=False), encoding="utf-8")
+        if agent_mode:
+            envelope["answers"] = answers
+        answers_path.write_text(json.dumps(envelope if agent_mode else answers, ensure_ascii=False), encoding="utf-8")
     else:
-        raise AssertionError("超过30次 CLI 调用预算")
+        raise AssertionError("超过100次 CLI 调用预算")
     checked = validate_outputs(destination)
     ledger = json.loads((destination / "ledger.json").read_text(encoding="utf-8"))
     expected_records = {"jiangyin": 1768, "xinhe": 289, "yixing": 10241}
@@ -113,7 +153,7 @@ def verify(path: Path, destination: Path, kind: str) -> dict:
             "summary": checked["summary"], "source_coverage": ledger["source_coverage"],
             **totals, "elapsed_seconds": round(time.monotonic() - started, 2), "calls": call_log,
             "selection_policy": "结构语义为测试夹具，项目关系模拟首个候选，所有非精确企业保持不确定",
-            "model_calls": 0, "not_platform_blind_test": True}
+            "model_calls": 0, "not_platform_blind_test": True, "agent_protocol": agent_mode}
 
 
 def main():
@@ -121,11 +161,12 @@ def main():
     for name in ("jiangyin", "xinhe", "yixing"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--agent", action="store_true", help="验证平台短响应入口与公开证据分页")
     args = parser.parse_args()
     args.output_root.mkdir(parents=True, exist_ok=False)
     reports = []
     for name in ("jiangyin", "xinhe", "yixing"):
-        report = verify(getattr(args, name), args.output_root / name, name)
+        report = verify(getattr(args, name), args.output_root / name, name, args.agent)
         reports.append(report)
         print(json.dumps(report, ensure_ascii=False), flush=True)
     (args.output_root / "workflow-verification.json").write_text(json.dumps(reports, ensure_ascii=False, indent=2), encoding="utf-8")

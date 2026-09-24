@@ -9,11 +9,11 @@ from .contract import clean, name_key, stable_id
 
 COMMON_WORDS = re.compile(r"有限责任|股份|有限|公司|集团|建设|建筑|工程|水利|市政|节水|器材")
 POLICY = {
-    "version": 3,
+    "version": 4,
     "company_name": "bidder_preferred",
     "method": "deterministic_with_user_resolution",
     "automatic_match": "exact_name_only",
-    "recommendation": "safe_same_row_then_name_similarity",
+    "recommendation": "safe_same_row_then_unique_name_similarity",
     "core_weight": 0.65,
     "auxiliary_fields": "audit_only",
 }
@@ -144,6 +144,9 @@ def match_group(group: dict, resolutions: dict[str, dict] | None = None,
             candidates[0] if candidates else None
         )
         recommendation_basis = "same_row" if recommended in same_row and row_recommendation["safe"] else "name_similarity"
+        if recommendation_basis == "name_similarity" and len(candidates) > 1 and candidates[0]["score"] == candidates[1]["score"]:
+            recommended = None
+            recommendation_basis = "ambiguous_name"
         case.update(
             selected=selected,
             basis=basis,
@@ -157,7 +160,7 @@ def match_group(group: dict, resolutions: dict[str, dict] | None = None,
         award, selected = case["award"], case["selected"]
         conflict = case["conflict"] or bool(selected and targets[selected["record_id"]] > 1)
         applied = selected is not None and not conflict
-        displayed = case["candidates"][:3]
+        displayed = case["candidates"][:5]
         for candidate in (selected, case["recommended"]):
             if candidate and candidate not in displayed:
                 displayed.append(candidate)
@@ -176,7 +179,7 @@ def match_group(group: dict, resolutions: dict[str, dict] | None = None,
             "recommended_bidder_name": case["recommended"]["name"] if case["recommended"] else None,
             "recommendation_basis": case["recommendation_basis"],
             "recommendation_reason": row_recommendation["reason"] if case["recommendation_basis"] == "same_row" else
-                                     "组内名称最接近",
+                                     "候选名称评分并列，需额外依据，不设推荐项" if case["recommendation_basis"] == "ambiguous_name" else "组内名称最接近",
             "resolution": resolution if resolution and resolution.get("decision") == "select_bidder" else None,
         })
         if applied:

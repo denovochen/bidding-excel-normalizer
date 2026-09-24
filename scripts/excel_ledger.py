@@ -26,7 +26,7 @@ from ledger_core import workflow
 PROGRESS_TITLES = ("读取并检查 Excel", "清洗并整理数据", "生成并校验结果")
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, emit=None) -> int:
     parser = argparse.ArgumentParser(description="招投标 Excel 结构识别辅助与确定性清洗")
     commands = parser.add_subparsers(dest="command", required=True)
     run = commands.add_parser("run", help="整理上传文件；首次扫描后由 Agent 轻量审阅结构，再用 --plan 完成")
@@ -64,6 +64,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     active_step = 0
 
+    def respond(value: dict, error: bool = False) -> None:
+        if emit is not None:
+            emit(value)
+        else:
+            print(json.dumps(value, ensure_ascii=False, allow_nan=False),
+                  file=sys.stderr if error else sys.stdout, flush=True)
+
     def progress(step: int, status: str) -> None:
         nonlocal active_step
         if not getattr(args, "progress", False):
@@ -91,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
             result = {"kind": "environment", "python": sys.executable, "packages": packages,
                       "ready": all(item["compatible"] for item in packages.values())}
             if not result["ready"]:
-                print(json.dumps(result, ensure_ascii=False), file=sys.stderr, flush=True)
+                respond(result, error=True)
                 return 2
         elif args.command == "plan":
             inspection = load_json(args.inspection.expanduser().resolve(strict=True))
@@ -114,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
             raw_state = load_json(args.state)
             if raw_state.get("stage") == "structure":
                 result = workflow.resume(args.state, raw_state, load_answers(args.answers))
-                print(json.dumps(result, ensure_ascii=False, allow_nan=False), flush=True)
+                respond(result)
                 return {"mapping_required": 3, "award_review_required": 4,
                         "relationship_review_required": 5}.get(result["kind"], 0)
             state = load_state(args.state)
@@ -155,7 +162,7 @@ def main(argv: list[str] | None = None) -> int:
                 if not args.region or not args.rows or args.inputs or args.sheet:
                     raise LedgerError("inspect --state 需要 --region 和 --rows，不能同时传入原文件或 Sheet")
                 result = workflow.inspect_region(args.state, load_json(args.state), args.region, args.rows, args.columns)
-                print(json.dumps(result, ensure_ascii=False, allow_nan=False), flush=True)
+                respond(result)
                 return 0
             if not args.inputs:
                 raise LedgerError("需要 Excel 输入路径，或使用 inspect --state --region --rows")
@@ -199,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
                     if books:
                         output = args.output or Path.cwd() / "outputs" / ("excel-ledger-" + uuid.uuid4().hex)
                         result = workflow.start(args.inputs, books, source_failures, output)
-                        print(json.dumps(result, ensure_ascii=False, allow_nan=False), flush=True)
+                        respond(result)
                         return 3
                     plan = inspect_workbooks(books, source_failures)["suggested_plan"]
                 prepared = build_outputs(books, plan, source_failures=source_failures)
@@ -225,17 +232,16 @@ def main(argv: list[str] | None = None) -> int:
                         if plan_parent.name.startswith(".excel-ledger-work-") and plan_parent.exists():
                             cleanup_work_directory(plan_parent)
                     progress(3, "completed")
-        print(json.dumps(result, ensure_ascii=False, allow_nan=False), flush=True)
+        respond(result)
         return 5 if result["kind"] == "relationship_review_required" else 4 if result["kind"] == "award_review_required" else 0
     except MappingRevisionRequired as exc:
-        print(json.dumps({"kind": "mapping_required", "message": str(exc), "evidence": exc.evidence},
-                         ensure_ascii=False), flush=True)
+        respond({"kind": "mapping_required", "message": str(exc), "evidence": exc.evidence})
         return 3
     except (LedgerError, OSError, ValueError, TypeError, KeyError, csv.Error) as exc:
         if active_step:
             progress(active_step, "failed")
         message = str(exc) if isinstance(exc, LedgerError) else f"输入或产物无效 ({type(exc).__name__})"
-        print(json.dumps({"kind": "error", "message": message}, ensure_ascii=False), file=sys.stderr, flush=True)
+        respond({"kind": "error", "message": message}, error=True)
         return 2
 
 if __name__ == "__main__":

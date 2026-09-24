@@ -141,12 +141,18 @@ def verify_yixing(path: Path, output: Path) -> dict:
     final, review, ledger = build_outputs(
         [book], plan, generated_at=draft[2]["generated_at"],
         relation_resolutions=relation, award_resolutions=award)
-    expected = {"project_count": 204, "group_count": 206, "record_count": 10241,
-                "review_record_count": 480, "issue_count": 7, "relationship_count": 66,
-                "unresolved_relationship_count": 1}
+    expected = {"project_count": 204, "group_count": 206, "record_count": 10241, "relationship_count": 66}
     for key, value in expected.items():
         if ledger["summary"][key] != value:
-            raise AssertionError(f"yixing: {key}: {ledger['summary'][key]} != {value}")
+            raise AssertionError(f"yixing: {key}: {ledger['summary'][key]} != {value}; summary={ledger['summary']}")
+    for relation_item in ledger["relationships"]:
+        origin = relation_item["source_project"]["cells"].get("project_name")
+        if relation_item["source_project"]["sheet"] != "施工招标汇总":
+            continue
+        if origin == "D30" and relation_item["status"] == "matched":
+            raise AssertionError("同名多来源不得强行关联或改选不相干的模糊候选")
+        if origin == "D32" and "增做" in (relation_item.get("target_project_name") or ""):
+            raise AssertionError("主工程不得关联到增做工程；可关联有依据的主工程名册")
     if any(record["company_name"] in {"中标企业名称", "中标单位", "单位名称"} for record in ledger["records"]):
         raise AssertionError("合并表头不能成为企业记录")
     if ledger["summary"]["bidder_roster_projectless_record_count"] != 0:

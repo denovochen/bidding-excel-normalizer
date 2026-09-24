@@ -1,6 +1,6 @@
 # bidding-excel-normalizer
 
-独立的招投标 Excel 整理 Skill，当前版本 **1.8.0**。输入 XLS/XLSX，通过有界结构语义判断与独立来源分块处理陌生表格，最终交付 final.csv、review_queue.csv、ledger.json。
+独立的招投标 Excel 整理 Skill，当前版本 **1.8.1**。输入 XLS/XLSX，通过有界结构语义判断与独立来源分块处理陌生表格，最终交付 final.csv、review_queue.csv、ledger.json。
 
 脚本全量扫描来源，收集独立投标块证据、分组、清洗、关联项目并核验来源覆盖；模型只解释列含义、区域布局和表关系，或选择有界项目候选。完整 plan 由 Python 编译，普通运行不要求模型设置分组模式、读源码或编写临时脚本。存在投标列时公司名称始终来自投标列，中标栏不替换、纠正投标全称。
 
@@ -9,9 +9,11 @@
 | 路径 | 用途 |
 |---|---|
 | SKILL.md | 精简执行入口及交付要求 |
+| scripts/excel_agent.py | 平台短响应、问题分页、批次答案与幂等提交 |
 | scripts/excel_ledger.py | 运行、局部检查、产物校验及读取去重名单 |
 | scripts/ledger_core/ | 结构读取、确定性中标匹配、审计和发布 |
 | references/semantic-review.md | 正常运行中的结构语义答案契约 |
+| references/agent-protocol.md | 平台接入、响应预算和宿主职责 |
 | references/mapping.md | 旧 plan/patch 兼容及开发诊断 |
 | references/cross-sheet-relations.md | 汇总表与投标明细表的通用跨表关系 |
 | references/relation-review.md | 非精确项目名称候选的内部复核 |
@@ -30,16 +32,20 @@ python -m pip install -r requirements.txt
 
 ```bash
 python -B -m unittest discover -s tests
-python scripts/excel_ledger.py doctor
-python scripts/excel_ledger.py run <Excel路径> --output <工作区内的结果目录>
-python scripts/excel_ledger.py resolve --state <state.json> --answers <answers.json>
+python scripts/excel_agent.py doctor
+python scripts/excel_agent.py run <Excel路径> --output <任务工作区内的空结果目录>
+# 填写返回的 answer_file，执行 next_command
 ```
 
-首次 run 返回 `mapping_required`、`stage=structure`、state、最多3个结构语义问题和完整 `next_command`，退出码3。同一表头结构归为一组判断。Agent 只提交当前问题的列角色、记录布局、项目上下文来源及中标完整性依据，Python 生成并验证 plan。非精确项目关系返回退出码5；非精确中标名称返回退出码4，并明确 `decision_owner=user`。全部通过 `resolve --state ... --answers ...` 继续，无需猜参数或重读完整状态。退出码0表示产物已发布，退出码2表示不可恢复错误。旧 `--plan` 和 `plan --patch` 入口仍兼容，但不能绕过来源边界校验。
+平台入口正常交接退出0，由 `kind` 表示结构、项目关系、用户确认或最终结果；错误退出2。默认响应不超过6000字符，完整问题通过 `question --section` 分页；下一步命令、角色与答案文件优先显示。程序生成带 batch_id/state_version 的独立答案文件，拒绝陈旧或跨批次答案，相同答案重试返回当前快照。输出必须指定到任务目录，避免模型事后复制产物。协议及中断恢复边界见 [平台协议](references/agent-protocol.md)。
+
+底层 `excel_ledger.py` 的原有接口继续兼容：结构交接退出3，项目关系退出5，中标企业退出4，发布退出0，错误退出2。结构每批最多3问、复核最多5问，平台入口可按预算缩小批次。旧 `--plan` 和 `plan --patch` 仍可用但不能绕过来源边界校验。旧产物可只读 validate；未完成状态不能跨解析器版本恢复。
 
 结构判断失败最多允许两次，不能解释的区域保留独立复核。额外证据使用返回的 `inspect_command`，每次最多20行、16列，宽表可用 `--columns A:P` 分页。不存在按文件名、城市或 Sheet 名称选择的生产适配器。未知含义仍需模型解释，并排重复业务列等无法无歧义拆分的区域保留复核，不声称任意来源都能自动恢复缺失业务事实。
 
-自动确认限于组内精确名称和原表明确中标状态。安全同行优先作为推荐项，否则按组内名称接近程度推荐；法人和金额只作来源审计。用户可选择推荐项、Other 输入当前组投标名称或“不确定”，最终文件始终由 Python 重建。
+自动确认限于组内精确名称和原表明确中标状态。安全同行优先作为推荐项，否则仅对不并列的最佳名称候选推荐；并列时展示有界候选且不设唯一推荐。法人和金额只作来源审计。用户可选择候选、Other 输入当前组投标名称或“不确定”，最终文件始终由 Python 重建。
+
+1.8.1 保留1.8的分块和提取核心，增加项目身份冲突检查：明确年度/编号/资金/建设类型冲突、主工程与追加工程差异、无唯一依据的同名多来源不能被模型直接关联。新项目关系选择标为 model_selection，保留 actor 和依据；中标身份仍需宿主验证。交付摘要由实际 issues、队列和 audit_warnings 生成，区分问题数、受影响记录数和辅助提示。Skill 不能代替平台限制通用 Agent 的任意命令工具。
 
 投标栏自身的错字、重复地名或异常公司后缀会保留；只清理格式和完整企业后缀后的“投标”附注。纯中标名单继续按 award_company 角色保留。unique_companies 是去重文本名称集合，不能称为已确认的企业实体数量。
 

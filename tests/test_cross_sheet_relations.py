@@ -154,7 +154,7 @@ class CrossSheetRelationTests(unittest.TestCase):
                          [("甲公司", "是"), ("乙公司", "否")])
         self.assertFalse(review)
 
-    def test_nonexact_candidates_are_bounded_year_is_auxiliary_and_bidders_do_not_reverse_match(self):
+    def test_nonexact_candidates_prioritize_nonconflicting_year_and_do_not_reverse_match(self):
         roster = [
             ["项目名称", "年度", "投标单位名称"],
             ["东片灌溉改造工程（财政补助）", "2023", "唯一中标企业"],
@@ -175,8 +175,8 @@ class CrossSheetRelationTests(unittest.TestCase):
         relation = ledger["relationships"][0]
         self.assertEqual(relation["status"], "unresolved")
         self.assertEqual(len(relation["candidates"]), 5)
-        self.assertEqual(relation["candidates"][0]["project_name"], "东片灌溉改造工程(财政补助)")
-        self.assertFalse(relation["candidates"][0]["year_match"])
+        self.assertTrue(all(candidate["year_match"] for candidate in relation["candidates"]))
+        self.assertNotEqual(relation["candidates"][0]["project_name"], "东片灌溉改造工程(财政补助)")
         self.assertNotIn("bidder", json.dumps(relation["candidates"], ensure_ascii=False).lower())
         questions, total, remaining = pending_questions(ledger, {})
         self.assertEqual((total, remaining), (1, 1))
@@ -218,7 +218,59 @@ class CrossSheetRelationTests(unittest.TestCase):
                                               relation_resolutions=relation)
         self.assertEqual([(row["公司名称"], row["中标与否"]) for row in final], [("甲公司", "是"), ("乙公司", "否")])
         self.assertFalse(review)
-        self.assertEqual(ledger["relationships"][0]["basis"], "user_selection")
+        self.assertEqual(ledger["relationships"][0]["basis"], "model_selection")
+        self.assertEqual(ledger["relationship_resolutions"][0]["actor"], "model")
+        publish(self.root / "checked", final, review, ledger)
+
+    def test_extension_scope_conflict_cannot_be_forced_by_a_candidate_id(self):
+        book = self.book(
+            [["项目名称", "中标单位"], ["2024年清溪建设项目", "甲公司"]],
+            [["项目名称", "投标单位名称"], ["2024年清溪建设项目招标节余资金增做工程", "甲公司"]],
+        )
+        plan = self.plan(book)
+        _, _, draft = build_outputs([book], plan)
+        relation = draft["relationships"][0]
+        self.assertTrue(relation["candidates"][0]["selection_blockers"])
+        self.assertEqual(pending_questions(draft, {})[0], [])
+        forged = {relation["review_task_id"]: {"decision": "select_project",
+                    "project_id": relation["candidates"][0]["project_id"], "actor": "model"}}
+        final, review, ledger = build_outputs([book], plan, relation_resolutions=forged)
+        self.assertEqual(ledger["relationships"][0]["status"], "unresolved")
+        self.assertTrue(all(row["中标与否"] == "" for row in final))
+        self.assertTrue(review)
+
+    def test_explicit_identity_conflicts_and_equivalent_construction_wording(self):
+        from ledger_core.relations import selection_blockers
+        def project(name):
+            return {"id": name, "values": {"project_name": name}}
+        source = project("2024年度甲市清溪镇东片高标准农田新建项目(财政补助)")
+        equal = project("2024年甲市清溪镇东片高标准农田新增建设项目")
+        self.assertFalse(selection_blockers(source, equal, [equal]))
+        for name in ("2024年甲市春雨镇东片高标准农田新建项目",
+                     "2024年甲市清溪镇西片高标准农田新建项目",
+                     "2023年甲市清溪镇东片高标准农田新建项目",
+                     "2024年甲市清溪镇东片高标准农田改造提升项目",
+                     "2024年甲市清溪镇东片高标准农田新建项目(增发国债)"):
+            target = project(name)
+            self.assertTrue(selection_blockers(source, target, [target]), name)
+
+    def test_duplicate_names_need_identity_evidence_not_source_order(self):
+        book = self.book(
+            [["项目名称", "中标单位"], ["2024年清溪建设项目", "甲公司"]],
+            [["项目名称", "投标单位名称", "投标单位数量"],
+             ["2024年清溪建设项目", "甲公司", 1], ["2024年清溪建设项目", "乙公司", 1],
+             ["2024年清溪建设项目其他工程", "丙公司", 1]],
+        )
+        plan = self.plan(book)
+        roster = plan["sources"][0]["sheets"][1]["tables"][0]
+        roster["project_mode"] = "blocks"
+        roster["structure_warnings"] = []
+        _, _, ledger = build_outputs([book], plan)
+        relation = ledger["relationships"][0]
+        self.assertEqual(len(relation["candidates"]), 2)
+        self.assertTrue(all(candidate["selection_blockers"] for candidate in relation["candidates"]))
+        self.assertEqual(relation["status"], "unresolved")
+        self.assertFalse(pending_questions(ledger, {})[0])
 
     def test_deferred_relation_publishes_roster_and_standalone_review(self):
         book = self.book(
