@@ -453,7 +453,7 @@ HEADER_NAMES = {
     "project_year": ["实施年度", "立项时间", "年度"],
     "project_owner": ["项目实施主体", "建设单位", "项目业主"],
     "agent": ["招标代理公司名称", "招标代理机构", "代理公司"],
-    "lot_name": ["标段", "标段名称", "标包名称"],
+    "lot_name": ["标段", "标段名称", "标包名称", "项目标段"],
     "lot_code": ["标段编号", "标包编号"],
     "bidder_name": ["投标单位名称", "投标企业名称", "投标人名称", "各投标企业名称(中标及未中标单位)", "投标企业名单", "投标人名单", "公司名称", "企业名称", "投标单位", "投标企业"],
     "bidder_serial": ["投标序号"],
@@ -512,6 +512,21 @@ def _header_text(sheet: Sheet, headers: list[int], col: int) -> str:
                                     if text(sheet.resolved(row, col)[0].value)))
 
 
+def header_extent(sheet: Sheet, headers: list[int], columns: dict[str, str]) -> list[int]:
+    """纵向合并的业务表头可以覆盖只有人员子表头的下一行。"""
+    result = list(headers)
+    for row in range(max(headers) + 1, min(max(headers) + 3, sheet.max_row) + 1):
+        matches = _row_header_matches(sheet, row)
+        business = {role: column_number(label) for role, label in columns.items() if role in BUSINESS_ROLES}
+        inherited_header = any(sheet.resolved(row, col)[1] in result for col in business.values())
+        direct_business = any(text(sheet.raw(row, col).value) and matches.get(role) != column_label(col)
+                              for role, col in business.items())
+        if not inherited_header or direct_business:
+            break
+        result.append(row)
+    return result
+
+
 def suggest_table(sheet: Sheet) -> dict[str, Any] | None:
     matches = {}
     header_rows = set()
@@ -527,7 +542,7 @@ def suggest_table(sheet: Sheet) -> dict[str, Any] | None:
         row not in header_rows for row in sheet.row_numbers if min(header_rows) <= row <= max(header_rows)
     ):
         return None
-    headers = list(range(min(header_rows), max(header_rows) + 1))
+    headers = header_extent(sheet, list(range(min(header_rows), max(header_rows) + 1)), matches)
     last_header = max(headers)
     data_rows = [row for row in sheet.row_numbers if row > last_header]
     if not data_rows:
@@ -717,6 +732,8 @@ def compact_inspection(inspection: dict[str, Any], saved_path: Path | None = Non
                     "table_id": table.get("table_id"), "table_kind": table.get("table_kind"),
                     "rows": [table["data_start_row"], table["data_end_row"]],
                     "header_rows": table["header_rows"], "columns": table["columns"],
+                    "project_mode": table["project_mode"], "group_mode": table["group_mode"],
+                    "group_start_field": table.get("group_start_field"),
                     "unrecognized_columns": [
                         {"column": item["column"], "header": item.get("header", ""),
                          "nonempty_count": column_stats.get(item["column"], {}).get("nonempty_count", 0),
@@ -788,7 +805,7 @@ def apply_plan_patch(inspection: dict[str, Any], patch: dict[str, Any]) -> dict[
         allowed = {"table_kind", "header_rows", "data_start_row", "data_end_row", "columns", "project_mode",
                    "group_mode", "group_start_field", "bidder_separator", "award_completeness", "award_mode",
                    "column_dispositions", "structure_warnings", "summary_markers", "non_tender_markers",
-                   "project_context_fields"}
+                   "project_context_fields", "lot_context_fields"}
         if set(update["set"]) - allowed:
             raise LedgerError("table_updates 包含不可修改字段")
         for table_id in table_ids:
@@ -877,7 +894,7 @@ def validate_plan(plan: dict[str, Any], books: list[Workbook]) -> None:
                 allowed = {"header_rows", "data_start_row", "data_end_row", "columns", "project_mode", "group_mode",
                            "group_start_field", "bidder_separator", "award_list_complete", "award_completeness",
                            "summary_markers", "non_tender_markers", "award_mode", "column_dispositions",
-                           "structure_warnings", "table_id", "table_kind", "project_context_fields"}
+                           "structure_warnings", "table_id", "table_kind", "project_context_fields", "lot_context_fields"}
                 required = {"header_rows", "data_start_row", "data_end_row", "columns", "project_mode", "group_mode",
                             "bidder_separator", "summary_markers", "non_tender_markers"}
                 _keys(table, allowed, required)
@@ -972,7 +989,12 @@ def validate_plan(plan: dict[str, Any], books: list[Workbook]) -> None:
                     raise LedgerError("project_context_fields 只能引用已映射的 lot_name/lot_code/notes")
                 if project_context_fields and table["project_mode"] != "blocks":
                     raise LedgerError("project_context_fields 仅适用于 project_mode=blocks")
-                if table["group_mode"] not in {"anchor", "row", "project", "lot", "source"}:
+                lot_context = table.get("lot_context_fields", [])
+                if (not isinstance(lot_context, list) or any(role not in {"lot_name", "lot_code"} or role not in columns
+                                                           for role in lot_context) or
+                        set(lot_context) & set(project_context_fields)):
+                    raise LedgerError("lot_context_fields 只能引用已映射且未兼作项目的标段角色")
+                if table["group_mode"] not in {"anchor", "row", "project", "lot", "source", "source_blocks"}:
                     raise LedgerError("group_mode 无效")
                 if table["group_mode"] == "anchor" and table.get("group_start_field") not in columns:
                     raise LedgerError("anchor 分组必须指定已映射的 group_start_field")
@@ -1013,6 +1035,19 @@ def validate_plan(plan: dict[str, Any], books: list[Workbook]) -> None:
                 scope = set(range(start, end + 1))
                 if covered & scope:
                     raise LedgerError("忽略区域与数据/表头重叠")
+                for table in spec["tables"]:
+                    label = table["columns"].get("bidder_name")
+                    if not label:
+                        continue
+                    for row in scope:
+                        cell = sheet.raw(row, column_number(label))
+                        value = clean(cell.value)
+                        if row > max(table["header_rows"]) and (cell.formula or cell.error or value) and value not in (
+                                set(table["summary_markers"]) | set(HEADER_NAMES["bidder_name"])):
+                            raise MappingRevisionRequired("忽略范围包含潜在投标企业来源，应解析或转入复核", {
+                                "source": book.path.name, "sheet": sheet.name, "row": row,
+                                "cell": coordinate(row, column_number(label)), "code": "BIDDER_SOURCE_IGNORED",
+                            })
                 covered |= scope
             review_regions = spec.get("review_regions", [])
             if not isinstance(review_regions, list):

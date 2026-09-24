@@ -84,6 +84,9 @@ def _candidate_evidence(source: dict[str, Any], target: dict[str, Any], score: f
     if source_year and source_year == target_year:
         evidence.append("年度一致")
     evidence.append(f"项目名称相似度={score:.3f}")
+    origin = target.get("cells", {}).get("project_name") or target.get("cells", {}).get("project_code")
+    if origin:
+        evidence.append(f"项目来源={target['sheet']}!{origin}")
     return evidence
 
 
@@ -142,6 +145,7 @@ def _relation_task_id(relation_id: str, source_project_id: str) -> str:
 def _copy_award(award: dict[str, Any], source_group: dict[str, Any], target_group: dict[str, Any]) -> None:
     copied = dict(award)
     copied["relation_source"] = {
+        "source_id": source_group["source_id"],
         "group_id": source_group["id"], "sheet": source_group["sheet"],
         "row": source_group["anchor_row"], "lot_name": source_group["lot_name"],
         "lot_code": source_group["lot_code"],
@@ -226,6 +230,11 @@ def _project_level_group(relation_id: str, target_project: dict[str, Any], sourc
                                            for reason in item.get("candidate_coverage", {}).get("reasons", []))),
         },
     })
+    if len(group["source_block_ids"]) > 1:
+        group["candidate_coverage"] = {
+            "complete": False,
+            "reasons": [*group["candidate_coverage"]["reasons"], "中标标段无法唯一分配到独立来源投标块"],
+        }
     for target in target_groups:
         for record in target["records"]:
             copied = deepcopy(record)
@@ -355,13 +364,17 @@ def apply_relationships(projects: list[dict[str, Any]], groups: list[dict[str, A
             consumed_groups.update(group["id"] for group in groups_by_project[source["id"]])
             task_id = _relation_task_id(relation_id, source["id"])
             exact = _exact_candidates(source, target_projects, keys)
-            ranked = _rank_candidates(source, target_projects)
+            eligible_targets = [project for project in target_projects if all(
+                group.get("candidate_coverage", {}).get("complete", True)
+                for group in groups_by_project[project["id"]])]
+            ranked = _rank_candidates(source, eligible_targets)
             decision = resolutions.get(task_id)
             selected = exact[0] if len(exact) == 1 else None
             basis = "exact_project_key" if selected else "unresolved"
             if not selected and decision and decision.get("decision") == "select_project":
-                selected = next((project for project in target_projects
-                                 if project["id"] == decision.get("project_id")), None)
+                selected = next((project for project in eligible_targets
+                                 if project["id"] == decision.get("project_id") and
+                                 project["id"] in {item["project_id"] for item in ranked}), None)
                 basis = "user_selection" if selected else "invalid_resolution"
             audit = {
                 "id": stable_id("project_relation", relation_id, source["id"]),

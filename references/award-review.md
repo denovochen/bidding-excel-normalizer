@@ -1,5 +1,7 @@
 # 中标企业人工确认
 
+`decision_owner=user` 表示必须使用真实用户回复。脚本拒绝当前批次之外的答案，但本地 JSON 不能证明是谁作出的选择；`confirmation_provenance=local_answer_file_not_host_verified` 明确记录这一限制。只有宿主提供可信提问回执才能进一步验证来源，不能把模型自行选择描述为用户确认。宿主没有提问能力时保存 unresolved，继续交付带复核项的结果。
+
 仅在脚本返回 `kind=award_review_required` 时读取。该结果中的 `questions` 已符合内置“向用户提问”工具参数，不要补充候选、法人、金额、完整投标名单或相似度，也不要改写推荐项。
 
 直接调用：

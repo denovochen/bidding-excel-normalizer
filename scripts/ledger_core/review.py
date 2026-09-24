@@ -23,6 +23,7 @@ def _timestamp() -> str:
 def _award_tasks(ledger: dict[str, Any]) -> list[dict[str, Any]]:
     groups = {group["id"]: group for group in ledger["groups"]}
     projects = {project["id"]: project for project in ledger["projects"]}
+    source_files = {source["id"]: source["file_name"] for source in ledger["sources"]}
     tasks = []
     for issue in ledger["issues"]:
         task_id = issue.get("review_task_id")
@@ -35,7 +36,21 @@ def _award_tasks(ledger: dict[str, Any]) -> list[dict[str, Any]]:
         project = projects.get(group.get("project_id"), {"values": {}})
         project_name = clean(project.get("values", {}).get("project_name")) or clean(
             project.get("values", {}).get("project_code")) or "（原表未提供项目名称）"
-        question = f"项目：{project_name}\n原中标企业：{match['original_award']}\n\n请选择对应的投标企业"
+        source_rows = group.get("source_rows") or [group["anchor_row"]]
+        scope = group.get("lot_name") or group.get("lot_code") or "原表未提供标段名称"
+        location = (f"{source_files.get(group['source_id'], '')} / {group['sheet']} / "
+                    f"投标行{min(source_rows)}:{max(source_rows)}")
+        award_locations = []
+        for award in group["awards"]:
+            if award["cell"] in match["award_cells"]:
+                source = award.get("relation_source", {})
+                origin = (f"{source_files.get(source.get('source_id', group['source_id']), '')} / "
+                          f"{source.get('sheet', group['sheet'])}!{award['cell']}")
+                if origin not in award_locations:
+                    award_locations.append(origin)
+        question = (f"项目：{project_name}\n招标范围：{scope}\n投标来源：{location}\n"
+                    f"中标来源：{'; '.join(award_locations)}\n"
+                    f"原中标企业：{match['original_award']}\n\n请选择对应的投标企业")
         tasks.append({
             "task_type": "award",
             "review_task_id": task_id,
@@ -195,6 +210,7 @@ def _answer_value(answer: Any) -> str:
 
 def apply_answers(state: dict[str, Any], ledger: dict[str, Any], answers: dict[str, Any]) -> list[dict[str, str]]:
     tasks = {task["review_task_id"]: task for task in _all_tasks(ledger)}
+    issued = {question["question_id"] for question in pending_questions(ledger, state["decisions"])[0]}
     records_by_group: dict[str, list[dict]] = {}
     for record in ledger["records"]:
         records_by_group.setdefault(record["group_id"], []).append(record)
@@ -207,7 +223,7 @@ def apply_answers(state: dict[str, Any], ledger: dict[str, Any], answers: dict[s
     errors = []
     for task_id, answer in answers.items():
         task = tasks.get(task_id)
-        if not task or task_id in decisions:
+        if not task or task_id in decisions or task_id not in issued:
             errors.append({"question_id": task_id, "message": "问题不存在、已处理或不属于当前复核状态"})
             continue
         try:
@@ -248,6 +264,7 @@ def apply_answers(state: dict[str, Any], ledger: dict[str, Any], answers: dict[s
             "company_name": selected["company_name"],
             "source": source,
             "decided_at": _timestamp(),
+            "confirmation_provenance": "local_answer_file_not_host_verified",
         }
         if source == "manual":
             decision["user_input"] = value
@@ -262,6 +279,9 @@ def review_result(state_path: Path, ledger: dict[str, Any], state: dict[str, Any
     state["review_task_count"] = max(state["review_task_count"], total)
     relation_ids = {task["review_task_id"] for task in _relation_tasks(ledger)}
     relation_review = bool(questions and questions[0]["question_id"] in relation_ids)
+    remaining_by_type = {kind: sum(task["task_type"] == kind and task["review_task_id"] not in state["decisions"]
+                                   for task in _all_tasks(ledger)) for kind in ("relation", "award")}
+    from .workflow import command
     return {
         "kind": "relationship_review_required" if relation_review else "award_review_required",
         "message": ("请确认非精确项目名称对应的投标明细项目。" if relation_review else
@@ -269,7 +289,11 @@ def review_result(state_path: Path, ledger: dict[str, Any], state: dict[str, Any
         "state": str(state_path),
         "review_task_count": total,
         "remaining_task_count": remaining,
+        "remaining_by_type": remaining_by_type,
+        "batch_task_type": "relation" if relation_review else "award",
         "questions": questions,
+        "decision_owner": "model" if relation_review else "user",
+        "next_command": command("resolve", state=state_path, answers=state_path.with_name("answers.json")),
         "validation_errors": validation_errors or [],
         "summary": ledger["summary"],
     }

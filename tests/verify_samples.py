@@ -6,6 +6,7 @@ import csv
 import hashlib
 import json
 import sys
+from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -140,6 +141,14 @@ def verify_yixing(path: Path, output: Path) -> dict:
     final, review, ledger = build_outputs(
         [book], plan, generated_at=draft[2]["generated_at"],
         relation_resolutions=relation, award_resolutions=award)
+    expected = {"project_count": 204, "group_count": 206, "record_count": 10241,
+                "review_record_count": 480, "issue_count": 7, "relationship_count": 66,
+                "unresolved_relationship_count": 1}
+    for key, value in expected.items():
+        if ledger["summary"][key] != value:
+            raise AssertionError(f"yixing: {key}: {ledger['summary'][key]} != {value}")
+    if any(record["company_name"] in {"中标企业名称", "中标单位", "单位名称"} for record in ledger["records"]):
+        raise AssertionError("合并表头不能成为企业记录")
     if ledger["summary"]["bidder_roster_projectless_record_count"] != 0:
         raise AssertionError("宜兴年度 bidder roster 仍存在无项目归属记录")
     if ledger["summary"]["cross_block_deduplication_count"] != 0:
@@ -340,7 +349,7 @@ def main() -> None:
                 if next(csv.reader(stream)) != FIELDS or not path.read_bytes().startswith(bytes([0xEF, 0xBB, 0xBF])):
                     raise AssertionError("与真实 MinerU CSV 列/编码不一致")
     report = {
-        "acceptance_date": "2026-09-23",
+        "acceptance_date": date.today().isoformat(),
         "samples": results,
         "mineru_headers_checked": bool(args.mineru_sample),
         "model_calls": 0,

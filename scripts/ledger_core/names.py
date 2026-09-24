@@ -90,7 +90,7 @@ def match_group(group: dict, resolutions: dict[str, dict] | None = None,
     cases = []
     for entries in awards.values():
         award = entries[0]
-        candidates = candidate_scores(award, group["records"])
+        candidates = candidate_scores(award, group["records"]) if candidate_coverage_complete else []
         cases.append({
             "award": award,
             "entries": entries,

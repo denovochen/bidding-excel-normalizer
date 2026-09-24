@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import copy
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -10,10 +11,11 @@ from .contract import (FIELDS, VERSION, LedgerError, MappingRevisionRequired, cl
 from .workbook import HEADER_NAMES, Workbook, Sheet, validate_plan
 from .names import POLICY, match_group
 from .relations import apply_relationships, infer_table_kind, table_identity
+from .structure import source_layout, verify_group_boundaries, simple_lot
 
 EMPTY_NAMES = {"", "/", "-", "—", "无", "暂无", "未招标", "未招投标", "未确定", "待定", "未中标", "否", "不适用", "待招标", "未开标"}
+AUDIT_ONLY_FIELDS = {"bidder_price", "award_price", "bidder_legal_person", "award_legal_person"}
 COMPANY_END = re.compile(r"(?:公司|工程队|工程处|合作社|事务所|中心|研究院|设计院|厂|经营部)$")
-PROJECT_CONTEXT = re.compile(r"(?:项目|工程)")
 EMPTY_LOTS = {"", "/", "-", "—", "主标段", "施工标段", "本标段", "全部标段"}
 
 
@@ -161,7 +163,7 @@ def _project_context_value(sheet: Sheet, row: int, table: dict[str, Any]) -> tup
         cell, source_row, source_col = sheet.resolved(row, column_number(table["columns"][role]))
         direct = sheet.raw(row, column_number(table["columns"][role]))
         value = "" if direct.formula or direct.error else clean(direct.value)
-        if value and PROJECT_CONTEXT.search(value):
+        if value and not simple_lot(value):
             return role, value, coordinate(source_row, source_col)
     return None, "", ""
 
@@ -172,12 +174,14 @@ def _lot_value(value: object) -> str:
 
 
 def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_index: int,
-                  aliases: dict[str, dict[str, str]], project_scope_index: int | None = None) -> tuple[list, list, list, list]:
+                  aliases: dict[str, dict[str, str]], project_scope_index: int | None = None,
+                  layout_override: dict | None = None) -> tuple[list, list, list, list]:
     projects, groups, issues, row_audit = {}, {}, [], []
     current_project = None
     current_group = None
     current_group_context = {}
     columns = table["columns"]
+    layout = layout_override if layout_override is not None else source_layout(book, sheet, table)
     table_id = table.get("table_id") or table_identity(book.sha256, sheet.index, table_index)
     table_kind = table.get("table_kind") or infer_table_kind(columns)
     award_mode = table.get("award_mode", "auto")
@@ -217,17 +221,31 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
             column_evidence[item["column"]] = {
                 "disposition": item["disposition"], "header": item.get("header", ""),
                 "value": "" if cell.formula or cell.error else text(cell.value),
-                "cell": coordinate(source_row, source_col), "reason": item["reason"],
+                "cell": coordinate(source_row, source_col), "reason_ref": table_id,
             }
         if clean(values.get("bidder_name")) in HEADER_NAMES["bidder_name"]:
             raise MappingRevisionRequired(f"{sheet.name} 第 {row} 行疑似重复/新表头，请拆成多个 table 映射", {
                 "source": book.path.name, "sheet": sheet.name, "row": row, "row_values": sheet.row_view(row),
             })
+        if project_role and clean(values.get(project_role)) in table["summary_markers"]:
+            row_audit.append({"source_id": book.source_id, "sheet": sheet.name, "row": row,
+                              "project_id": None, "type": "summary", "values": values,
+                              "raw_values": raw_values, "cells": cells, "column_evidence": column_evidence})
+            current_project = None
+            current_group = None
+            current_group_context = {}
+            continue
         raw_project = text(sheet.raw(row, project_col).value) if project_col else ""
+        if project_col and (sheet.raw(row, project_col).formula or sheet.raw(row, project_col).error):
+            current_project = None
+            current_group = None
+            current_group_context = {}
         mode = table["project_mode"]
         project_context_role = None
         if mode == "blocks":
             if raw_project:
+                project_anchor = cells[project_role]
+            elif project_role and values.get(project_role):
                 project_anchor = cells[project_role]
             elif project_role:
                 project_context_role, project_context, project_context_cell = _project_context_value(sheet, row, table)
@@ -238,6 +256,18 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
                     if project_context_role in {"lot_name", "lot_code"}:
                         values[project_context_role] = ""
                 elif current_project:
+                    for role in ("project_year", "project_code", "project_owner"):
+                        if role not in columns:
+                            continue
+                        direct = sheet.raw(row, column_number(columns[role]))
+                        previous = clean(current_project["values"].get(role))
+                        if (not direct.formula and not direct.error and clean(direct.value) and previous and
+                                clean(direct.value) != previous):
+                            raise MappingRevisionRequired("项目块上下文发生变化，不能继续继承上一项目", {
+                                "source": book.path.name, "sheet": sheet.name, "row": row,
+                                "code": "PROJECT_CONTEXT_CONFLICT", "field": role,
+                                "previous": previous, "current": clean(direct.value),
+                            })
                     project_anchor = current_project["anchor"]
                     for role in context_roles:
                         values[role] = current_project["values"].get(role, "")
@@ -287,6 +317,7 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
             continue
         unavailable = [role for role, label in columns.items()
                        if sheet.resolved(row, column_number(label))[0].formula or sheet.resolved(row, column_number(label))[0].error]
+        unavailable_business = [role for role in unavailable if role not in AUDIT_ONLY_FIELDS]
         bidder_raw = str(raw_values.get("bidder_name") or "") if "bidder_name" not in unavailable else ""
         award_raw = str(raw_values.get("award_name") or "") if "award_name" not in unavailable else ""
         company_role = "bidder_name" if "bidder_name" in columns else "award_name" if "award_name" in columns else None
@@ -294,7 +325,7 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
         explicit_context = any(role in columns and text(sheet.raw(row, column_number(columns[role])).value)
                                for role in ("project_name", "project_code", "lot_name", "lot_code"))
         context_record = not company_role or (not bidder_raw and not award_raw and bool(explicit_context))
-        substantive = bool(source_company or award_raw or values.get("bidder_count") or unavailable or context_record)
+        substantive = bool(source_company or award_raw or values.get("bidder_count") or unavailable_business or context_record)
         if not substantive:
             row_audit.append({**audit, "type": "context_only", "values": values, "raw_values": raw_values, "cells": cells})
             continue
@@ -330,7 +361,12 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
             group_context[label] = raw
             group_context_cells[label] = coordinate(source_row, source_col)
         group_mode = table["group_mode"]
-        if group_mode == "anchor":
+        if group_mode == "source_blocks":
+            group_anchor = layout["row_blocks"].get(row, ["context_row", row])
+            if current_group and row in layout["row_blocks"] and group_anchor in current_group.get("source_block_ids", []):
+                for role in ("lot_name", "lot_code"):
+                    values[role] = current_group[role]
+        elif group_mode == "anchor":
             anchor_field = table["group_start_field"]
             new_group = bool(text(sheet.raw(row, column_number(columns[anchor_field])).value))
             if not new_group and current_group and anchor_field in {"lot_name", "lot_code"}:
@@ -363,7 +399,7 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
             "company_role": company_role,
             "award_mode": award_mode, "group_mode": group_mode, "project_mode": mode, "table_index": table_index,
             "group_context": group_context, "group_context_cells": group_context_cells,
-            "project_required": bool(project_role), "source_block_ids": [gid],
+            "project_required": bool(project_role), "source_block_ids": [layout["row_blocks"].get(row, gid)],
             "candidate_coverage": {"complete": True, "reasons": []},
             "price_units": price_units,
             "price_unit_assumption": "未标单位的一侧沿用另一侧" if len(price_units) == 2 and bool(price_units.get("bidder_price")) != bool(price_units.get("award_price")) else "",
@@ -387,7 +423,8 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
                 values[role] = ""
         for role in unavailable:
             issues.append(_issue("FIELD_UNAVAILABLE", f"{role} 的来源为未计算公式或错误值，该字段留空", group,
-                                 source_row=row, field=role, source_cell=cells[role], raw_value=raw_values[role]))
+                                 source_row=row, field=role, source_cell=cells[role], raw_value=raw_values[role],
+                                 audit_only=role in AUDIT_ONLY_FIELDS))
         signal = procurement_signal(values.get("notes", ""), table["non_tender_markers"])
         if signal and signal not in group["procurement_signals"]:
             group["procurement_signals"].append(signal)
@@ -398,7 +435,8 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
             else:
                 issues.append(_issue("INVALID_BIDDER_COUNT", "投标数量不是可确认的整数", group, source_row=row, raw_value=count))
         occurrence = {"row": row, "cells": cells, "values": values, "raw_values": raw_values,
-                      "column_evidence": column_evidence}
+                      "column_evidence": column_evidence,
+                      "source_block_id": layout["row_blocks"].get(row, stable_id("source_row", book.sha256, sheet.index, row))}
         if award_raw:
             try:
                 award_names = split_names(award_raw, "delimited")
@@ -420,7 +458,7 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
             issues.append(_issue("BIDDER_LIST_AMBIGUOUS", str(exc), group, source_row=row,
                                  standalone=True, occurrence=occurrence))
             tokens = []
-        if context_record or (unavailable and not tokens):
+        if context_record or (unavailable_business and not tokens):
             tokens = [""]
         for index, raw in enumerate(tokens, 1):
             name, changes = normalize_name(raw, {})
@@ -432,7 +470,6 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
                 "id": stable_id("record", book.sha256, sheet.index, table_index, row, index),
                 "name": name, "project_id": project_id, "group_id": gid,
                 "occurrences": [{**occurrence, "fragment_index": index, "raw_company": raw, "company_role": company_role,
-                                 "source_block_id": gid,
                                  "single_bidder_row": company_role == "bidder_name" and len(tokens) == 1 and not _vertical_merge(sheet, row, "bidder_name", columns)}],
                 "changes": changes, "award_status": "", "rank": values.get("rank", "") if len(tokens) == 1 else "",
                 "explicit_award_status": values.get("award_status", "") if len(tokens) == 1 else "",
@@ -440,7 +477,12 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
             })
         if len(tokens) > 1 and values.get("rank"):
             issues.append(_issue("RANK_SCOPE_AMBIGUOUS", "同一名单包含多家企业，单个排名无法分配；排名留空", group, source_row=row))
-        row_audit.append({**audit, "group_id": gid, "type": "business", "bidder_mentions": len(tokens)})
+        row_audit.append({**audit, "group_id": gid, "type": "business", "bidder_mentions": len(tokens),
+                          "source_block_id": occurrence["source_block_id"], "company_role": company_role,
+                          "company_present": clean(source_company) not in EMPTY_NAMES or company_role in unavailable,
+                          "company_cell": cells.get(company_role),
+                          "company_fragments": len(tokens)})
+    verify_group_boundaries(book, sheet, list(groups.values()), layout)
     coverage_codes = {"BIDDER_LIST_AMBIGUOUS", "INVALID_COMPANY_NAME", "INVALID_BIDDER_COUNT"}
     for group in groups.values():
         if group["company_role"] != "bidder_name":
@@ -450,7 +492,8 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
             if issue.get("group_id") != group["id"]:
                 continue
             if issue["code"] in coverage_codes or (
-                    issue["code"] == "FIELD_UNAVAILABLE" and issue.get("field") == "bidder_name"):
+                    issue["code"] == "FIELD_UNAVAILABLE" and issue.get("field") in {
+                        "bidder_name", "project_name", "project_code", "lot_name", "lot_code", "bidder_count", "bidder_serial"}):
                 reasons.append(issue["message"])
         unique_records = {}
         for record in group["records"]:
@@ -465,6 +508,15 @@ def collect_table(book: Workbook, sheet: Sheet, table: dict[str, Any], table_ind
             "complete": not reasons,
             "reasons": list(dict.fromkeys(reasons)),
         }
+    for group in groups.values():
+        ids = {layout["row_blocks"].get(row) for row in group["source_rows"]}
+        group["source_blocks"] = [block for block in layout["blocks"] if block["id"] in ids]
+        headers = {row for block in group["source_blocks"] for row in block.get("context_rows", [])}
+        if any(record["name"] and not record["context_only"] for record in group["records"]):
+            group["records"] = [record for record in group["records"] if not (
+                record["context_only"] and all(occurrence["row"] in headers for occurrence in record["occurrences"]))]
+            if group["scope_type"] == "context":
+                group["scope_type"] = "business"
     return list(projects.values()), list(groups.values()), issues, row_audit
 
 
@@ -602,6 +654,8 @@ def _issue_identity(issue: dict[str, Any]) -> str:
         occurrence = issue.get("occurrence") or {}
         scope = ("standalone", issue.get("source_row") or occurrence.get("row"),
                  tuple(sorted((occurrence.get("cells") or {}).items())))
+    elif issue.get("source_row"):
+        scope = ("row", issue["source_row"])
     elif issue.get("record_name"):
         scope = ("record", issue.get("record_name"), tuple(issue.get("conflicting_fields", [])))
     elif issue.get("source_id") and not issue.get("group_id"):
@@ -612,11 +666,24 @@ def _issue_identity(issue: dict[str, Any]) -> str:
     return stable_id("issue", issue.get("group_id"), issue["code"], scope)
 
 
+def _affects_record(issue: dict, record: dict) -> bool:
+    if issue.get("record_name"):
+        return name_key(issue["record_name"]) == name_key(record["name"])
+    if issue.get("standalone"):
+        return False
+    if issue.get("source_row") and not (issue["code"] == "FIELD_UNAVAILABLE" and issue.get("field") in {
+            "project_name", "project_code", "lot_name", "lot_code", "bidder_name", "award_name", "bidder_count", "bidder_serial"}):
+        return any(occurrence["row"] == issue["source_row"] or (
+            issue.get("source_cell") and occurrence["cells"].get(issue.get("field")) == issue["source_cell"])
+                   for occurrence in record["occurrences"])
+    return True
+
+
 def _record_confidence(record: dict[str, Any], group: dict[str, Any], related: list[dict[str, Any]]) -> dict[str, Any]:
     company_unavailable = any(issue["code"] == "FIELD_UNAVAILABLE" and issue.get("field") == group["company_role"]
                               for issue in related)
     extraction = 0.25 if company_unavailable else 1.0 if record["name"] else 0.70
-    grouping = {"row": 1.0, "source": 1.0, "lot": 0.95, "anchor": 0.92,
+    grouping = {"row": 1.0, "source": 1.0, "source_blocks": 0.95, "lot": 0.95, "anchor": 0.92,
                 "project": 0.88}.get(group["group_mode"], 0.80)
     if group["group_context"]:
         grouping = max(grouping, 0.97)
@@ -686,15 +753,61 @@ def build_outputs(books: list[Workbook], plan: dict[str, Any], alias_payload: di
                                      end_row=max(sheet.row_numbers, default=1), reason=spec["reason"]))
                 continue
             header_scopes = {}
+            layouts = {}
+            for table_index, table in enumerate(spec["tables"]):
+                if "bidder_name" not in table["columns"]:
+                    continue
+                key = (tuple(table["header_rows"]), table["columns"]["bidder_name"])
+                layouts.setdefault(key, []).append((table_index, table))
+            layout_by_table = {}
+            for key, members in layouts.items():
+                scope = copy.deepcopy(members[0][1])
+                scope["data_start_row"] = min(table["data_start_row"] for _, table in members)
+                scope["data_end_row"] = max(table["data_end_row"] for _, table in members)
+                next_header = min((min(table["header_rows"]) for table in spec["tables"]
+                                   if min(table["header_rows"]) > max(key[0])), default=sheet.max_row + 1)
+                relevant_reviews = [region for region in spec.get("review_regions", [])
+                                    if scope["data_start_row"] <= region["start"] < next_header]
+                if relevant_reviews:
+                    scope["data_end_row"] = max(scope["data_end_row"], max(region["end"] for region in relevant_reviews))
+                if len({table["bidder_separator"] for _, table in members}) > 1:
+                    scope["bidder_separator"] = "single"
+                if relevant_reviews:
+                    for _, table in members:
+                        source_layout(book, sheet, table)
+                layout = source_layout(book, sheet, scope, strict=not relevant_reviews)
+                for index, _ in members:
+                    layout_by_table[index] = layout
+            sheet_groups = []
             for table_index, table in enumerate(spec["tables"]):
                 scope_index = header_scopes.setdefault(tuple(sorted(table["header_rows"])), table_index)
-                p, g, i, audit = collect_table(book, sheet, table, table_index, aliases, scope_index)
+                p, g, i, audit = collect_table(book, sheet, table, table_index, aliases, scope_index,
+                                              layout_by_table.get(table_index))
+                sheet_groups.extend(g)
                 projects.extend(p); groups.extend(g); issues.extend(i); row_audit.extend(audit)
+            for members in layouts.values():
+                indices = {index for index, _ in members}
+                layout = layout_by_table[members[0][0]]
+                scoped_groups = [group for group in sheet_groups if group["table_index"] in indices]
+                verify_group_boundaries(book, sheet, scoped_groups, layout)
+                covered_rows = {row for group in scoped_groups for row in group["source_rows"]}
+                for block in layout["blocks"]:
+                    missing = sorted(set(block["rows"]) - covered_rows)
+                    if not missing:
+                        continue
+                    affected = [group for group in scoped_groups if set(group["source_rows"]) & set(block["rows"])]
+                    for group in affected:
+                        group["candidate_coverage"]["complete"] = False
+                        group["candidate_coverage"]["reasons"].append("同一来源投标块有行未进入当前候选范围")
+                        issues.append(_issue("SOURCE_BLOCK_COVERAGE_GAP", "来源块有行转入复核或被排除，停止中标推荐", group,
+                                             missing_source_rows=missing, source_block_id=block["id"]))
             for region in spec.get("review_regions", []):
                 issues.append(_issue("SOURCE_REGION_UNRESOLVED", "局部结构未能可靠映射，已转入复核", None,
                                      standalone=True, source_id=book.source_id, source_file=book.path.name,
                                      sheet=sheet.name, start_row=region["start"], end_row=region["end"],
                                      reason=region["reason"]))
+    source_blocks = list({block["id"]: block for group in groups
+                          for block in group.pop("source_blocks", [])}.values())
     projects = list({p["id"]: p for p in projects}.values())
     projects, groups, issues, relationships, group_redirects = apply_relationships(
         projects, groups, issues, plan, relation_resolutions)
@@ -705,13 +818,17 @@ def build_outputs(books: list[Workbook], plan: dict[str, Any], alias_payload: di
             audit["group_id"] = group_redirects[original_group_id]
     for group in groups:
         finish_group(group, issues, award_resolutions)
+    audit_warnings = list({_issue_identity(issue): {"id": _issue_identity(issue), **{
+        key: value for key, value in issue.items() if key not in {"record_ids", "final_sequences", "review_sequences"}}}
+        for issue in issues if issue.get("audit_only")}.values())
+    issues = [issue for issue in issues if not issue.get("audit_only")]
     project_by_id = {p["id"]: p for p in projects}
     book_by_id = {b.source_id: b for b in books}
     # 分组问题对应整个组，避免只标候选而把其他企业误写成已确认未中标。
     group_by_id = {group["id"]: group for group in groups}
     for issue in issues:
         group = group_by_id.get(issue["group_id"])
-        issue["record_ids"] = [r["id"] for r in group["records"]] if group else []
+        issue["record_ids"] = [r["id"] for r in group["records"] if _affects_record(issue, r)] if group else []
         issue["id"] = _issue_identity(issue)
     # 字段问题按单元格保留；同一记录或组的同类问题按明确身份归并。
     issues = list({i["id"]: i for i in issues}.values())
@@ -719,8 +836,9 @@ def build_outputs(books: list[Workbook], plan: dict[str, Any], alias_payload: di
     for group in groups:
         project = project_by_id.get(group["project_id"], {"id": None, "values": {}, "cells": {}})
         source = book_by_id[group["source_id"]]
-        related = [i for i in issues if i["group_id"] == group["id"]]
+        group_issues = [i for i in issues if i["group_id"] == group["id"]]
         for record in group["records"]:
+            related = [issue for issue in group_issues if record["id"] in issue["record_ids"]]
             sequence = len(final) + 1
             occurrences = record["occurrences"]
             evidence = [f"Sheet={group['sheet']}"]
@@ -824,7 +942,7 @@ def build_outputs(books: list[Workbook], plan: dict[str, Any], alias_payload: di
         "sources": ([{"id": b.source_id, "file_name": b.path.name, "sha256": b.sha256, "size": b.size,
                       "format": b.format, "sheets": [s.name for s in b.sheets], "status": "parsed"} for b in books] +
                     [dict(failure) for failure in source_failures]),
-        "mapping": plan, "matching_policy": dict(POLICY),
+        "mapping": plan, "matching_policy": dict(POLICY), "source_blocks": source_blocks,
         "resolutions": [dict({"review_task_id": task_id}, **resolution)
                         for task_id, resolution in sorted(award_resolutions.items())],
         "summary": {
@@ -847,7 +965,8 @@ def build_outputs(books: list[Workbook], plan: dict[str, Any], alias_payload: di
                 for group in groups),
         },
         "projects": projects, "groups": [{k: v for k, v in g.items() if k != "records"} for g in groups],
-        "records": audit_records, "issues": issues, "row_audit": row_audit, "skipped_sheets": skipped,
+        "records": audit_records, "issues": issues, "audit_warnings": audit_warnings,
+        "row_audit": row_audit, "skipped_sheets": skipped,
         "unique_companies": list(unique.values()),
         "notes": ["置信度是由提取、分组和中标对应规则计算的可靠程度，不是正确概率；逐条组成和依据保存在 records.confidence。",
                   "非精确中标名称只生成推荐候选，必须由用户选择或保持不确定；法人和金额仅作来源审计。",
@@ -865,4 +984,6 @@ def build_outputs(books: list[Workbook], plan: dict[str, Any], alias_payload: di
             "relationship_count": len(relationships),
             "unresolved_relationship_count": sum(item["status"] != "matched" for item in relationships),
         })
+    from .coverage import validate_source_coverage
+    ledger["source_coverage"] = validate_source_coverage(ledger)
     return final, review, ledger

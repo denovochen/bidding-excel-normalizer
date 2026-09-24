@@ -1,4 +1,6 @@
-# 字段映射 v1
+# 兼容字段映射 v1
+
+本页只用于旧客户端 `--plan` / `plan --patch` 兼容及开发诊断。1.8 正常入口使用 [结构语义判断](semantic-review.md)。旧 plan 也必须通过独立来源块校验；错误合组或截断在去重前被拒绝。
 
 每次首次 `run` 都返回有界 `mapping_required` 摘要并将完整 inspection 保存到内部工作目录。模型只审阅摘要和必要的局部 `inspect --sheet --rows`，编写 plan patch，不读取完整 inspection 到上下文，不逐行处理企业、不判断企业名称对应、不修改解析源码。
 
@@ -19,8 +21,8 @@
     "set": {
       "table_kind": "bidder_roster",
       "columns": {"project_name": "D", "bidder_name": "I"},
-      "project_mode": "merged",
-      "group_mode": "project"
+      "project_mode": "blocks",
+      "group_mode": "source_blocks"
     }
   }]
 }
@@ -84,6 +86,7 @@ XLSX 有效内容由 OOXML 稀疏预扫描确定，空白样式不会产生业�
 | blocks | 无合并、仅块首填写项目，块内继承项目上下文 |
 | repeated | 平表按项目编号、名称、年度、实施主体组合 |
 | group_mode=source | 纯名册按来源区域去重，不表示共同投标 |
+| source_blocks | Python 从来源锚点、数量、标段、序号和批次证据分块，不按项目身份合并投标组 |
 | row | 每行一个组，单元格内企业名单展开 |
 | anchor | 多行一组，group_start_field 必须是真实稀疏或合并锚点 |
 | lot | 按项目及明确标段分组 |

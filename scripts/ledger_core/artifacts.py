@@ -107,11 +107,18 @@ def validate_outputs(output: Path) -> dict[str, Any]:
     if any(p.is_symlink() or not p.is_file() for p in output.iterdir()):
         raise LedgerError("产物必须为普通文件")
     # ledger 含逐条来源，可大于映射文件的 8 MiB 限制。
-    if (output / "ledger.json").stat().st_size > 128 * 1024 * 1024:
-        raise LedgerError("ledger.json 超限")
+    ledger_size = (output / "ledger.json").stat().st_size
+    if ledger_size > 128 * 1024 * 1024:
+        raise LedgerError(f"ledger.json 超限: {ledger_size} bytes > {128 * 1024 * 1024} bytes")
     ledger = json.loads((output / "ledger.json").read_text(encoding="utf-8"))
     if ledger.get("schema_version") != 1:
         raise LedgerError("ledger 版本不受支持")
+    if ledger.get("parser_version") == VERSION and "source_coverage" not in ledger:
+        raise LedgerError("新产物缺少独立来源覆盖审计")
+    if "source_coverage" in ledger:
+        from .coverage import validate_source_coverage
+        if ledger["source_coverage"] != validate_source_coverage(ledger):
+            raise LedgerError("来源覆盖计数与来源行清单不一致")
     _validate_name_decisions(ledger)
     _validate_award_matches(ledger)
     for name in ("final.csv", "review_queue.csv"):
@@ -202,7 +209,7 @@ def validate_outputs(output: Path) -> dict[str, Any]:
         "duplicate_mentions_removed": sum(len(r["occurrences"]) - 1 for r in records),
         "corrected_record_count": sum(bool(r["corrections"]) for r in records),
     }
-    if ledger.get("parser_version") == VERSION:
+    if ledger.get("parser_version") == VERSION or "bidder_roster_projectless_record_count" in ledger["summary"]:
         for group in groups.values():
             coverage = group.get("candidate_coverage")
             if (group.get("company_role") == "bidder_name" and
@@ -273,7 +280,14 @@ def validate_outputs(output: Path) -> dict[str, Any]:
                 raise LedgerError("标记不确定的项目关系不得自动匹配")
     if ledger["summary"] != expected_counts:
         raise LedgerError("summary 与明细计数不一致")
-    return {"validated": True, "summary": expected_counts}
+    return {"validated": True, "summary": expected_counts,
+            "checks": {"artifact_consistency": "passed",
+                       "source_accounting": "passed" if "source_coverage" in ledger else "not_available_legacy",
+                       "review_queue": "has_pending_items" if review else "empty",
+                       "audit_warning_count": len(ledger.get("audit_warnings", [])),
+                       "unparsed_region_count": sum(issue["code"] in {
+                           "SOURCE_REGION_UNRESOLVED", "SOURCE_REGION_SKIPPED", "SOURCE_UNREADABLE"}
+                           for issue in issues.values())}}
 
 
 def _validate_name_decisions(ledger: dict) -> None:

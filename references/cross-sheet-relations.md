@@ -1,5 +1,7 @@
 # 跨表项目关系 v1
 
+1.8 普通流程通过 `task_type=table_relationship` 选择业务对应的表集合，Python 编译关系。下文 plan.relationships JSON 仅用于旧客户端和开发诊断。
+
 仅在 inspection 返回 `relationship_candidates`，或已确认工作簿把中标结果与投标企业拆在不同区域时读取。
 
 ## 标准角色

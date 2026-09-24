@@ -20,6 +20,7 @@ from ledger_core.review import (apply_answers, cleanup_state, create_state, load
                                 create_work_directory, cleanup_work_directory)
 from ledger_core.workbook import (apply_plan_patch, compact_inspection, describe_source_failure, inspect_workbooks,
                                   load_json, read_workbook)
+from ledger_core import workflow
 
 
 PROGRESS_TITLES = ("读取并检查 Excel", "清洗并整理数据", "生成并校验结果")
@@ -34,7 +35,10 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--output", type=Path, help="省略时创建 outputs/excel-ledger-<唯一ID>")
     run.add_argument("--progress", action="store_true", help="可选：输出脚本实际阶段日志，不规定宿主进度计划")
     inspect = commands.add_parser("inspect", help="只读展示结构和建议映射，输出 JSON 到 stdout")
-    inspect.add_argument("inputs", type=Path, nargs="+")
+    inspect.add_argument("inputs", type=Path, nargs="*")
+    inspect.add_argument("--state", type=Path, help="结构会话中的有界补证据")
+    inspect.add_argument("--region", help="脚本返回的来源区域 ID")
+    inspect.add_argument("--columns", help="结构补证据的列分页，如 A:P")
     inspect.add_argument("--sheet", help="仅在 profile 中展示指定 Sheet 的局部行，不改变完整映射建议")
     inspect.add_argument("--rows", help="局部查看的闭区间，如 10:20；须与 --sheet 一起使用")
     inspect.add_argument("--save", type=Path, help="将完整 inspection JSON 保存到内部工作目录")
@@ -107,6 +111,12 @@ def main(argv: list[str] | None = None) -> int:
                 result = {"kind": "companies", "companies": ledger["unique_companies"],
                           "company_count": len(ledger["unique_companies"])}
         elif args.command == "resolve":
+            raw_state = load_json(args.state)
+            if raw_state.get("stage") == "structure":
+                result = workflow.resume(args.state, raw_state, load_answers(args.answers))
+                print(json.dumps(result, ensure_ascii=False, allow_nan=False), flush=True)
+                return {"mapping_required": 3, "award_review_required": 4,
+                        "relationship_review_required": 5}.get(result["kind"], 0)
             state = load_state(args.state)
             state_path = Path(state["state_path"])
             progress(1, "in_progress")
@@ -141,6 +151,14 @@ def main(argv: list[str] | None = None) -> int:
                     pass
                 progress(3, "completed")
         else:
+            if args.command == "inspect" and args.state:
+                if not args.region or not args.rows or args.inputs or args.sheet:
+                    raise LedgerError("inspect --state 需要 --region 和 --rows，不能同时传入原文件或 Sheet")
+                result = workflow.inspect_region(args.state, load_json(args.state), args.region, args.rows, args.columns)
+                print(json.dumps(result, ensure_ascii=False, allow_nan=False), flush=True)
+                return 0
+            if not args.inputs:
+                raise LedgerError("需要 Excel 输入路径，或使用 inspect --state --region --rows")
             progress(1, "in_progress")
             books, source_failures = [], []
             for path in args.inputs:
@@ -178,20 +196,12 @@ def main(argv: list[str] | None = None) -> int:
                 if args.plan:
                     plan = load_json(args.plan)
                 else:
-                    inspection = inspect_workbooks(books, source_failures)
                     if books:
                         output = args.output or Path.cwd() / "outputs" / ("excel-ledger-" + uuid.uuid4().hex)
-                        work_directory = create_work_directory(output)
-                        inspection_path = work_directory / "inspection.json"
-                        inspection_path.write_text(json.dumps(inspection, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
-                                                   encoding="utf-8")
-                        print(json.dumps({
-                            "kind": "mapping_required",
-                            "message": "审阅有界摘要并编写 plan patch；完整 inspection 已保存到内部工作目录。",
-                            "inspection": compact_inspection(inspection, inspection_path),
-                        }, ensure_ascii=False), flush=True)
+                        result = workflow.start(args.inputs, books, source_failures, output)
+                        print(json.dumps(result, ensure_ascii=False, allow_nan=False), flush=True)
                         return 3
-                    plan = inspection["suggested_plan"]
+                    plan = inspect_workbooks(books, source_failures)["suggested_plan"]
                 prepared = build_outputs(books, plan, source_failures=source_failures)
                 progress(2, "completed")
                 output = args.output or Path.cwd() / "outputs" / ("excel-ledger-" + uuid.uuid4().hex)

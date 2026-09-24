@@ -1,8 +1,8 @@
 # bidding-excel-normalizer
 
-独立的招投标 Excel 整理 Skill，当前版本 **1.7.1**。输入 XLS/XLSX，支持陌生结构映射、跨 Sheet 项目关系、项目候选复核和非精确中标名称确认，最终交付 final.csv、review_queue.csv、ledger.json。
+独立的招投标 Excel 整理 Skill，当前版本 **1.8.0**。输入 XLS/XLSX，通过有界结构语义判断与独立来源分块处理陌生表格，最终交付 final.csv、review_queue.csv、ledger.json。
 
-脚本全量扫描、分组、清洗、关联项目、对应中标记录并校验；模型轻量审阅结构并只编写 plan patch 或选择有界项目候选，不逐行判断企业名称。存在投标列时，最终公司名称始终来自投标列；中标栏仅用于对应结果与审计，不替换、纠正投标全称。
+脚本全量扫描来源，收集独立投标块证据、分组、清洗、关联项目并核验来源覆盖；模型只解释列含义、区域布局和表关系，或选择有界项目候选。完整 plan 由 Python 编译，普通运行不要求模型设置分组模式、读源码或编写临时脚本。存在投标列时公司名称始终来自投标列，中标栏不替换、纠正投标全称。
 
 ## 文件位置
 
@@ -11,7 +11,8 @@
 | SKILL.md | 精简执行入口及交付要求 |
 | scripts/excel_ledger.py | 运行、局部检查、产物校验及读取去重名单 |
 | scripts/ledger_core/ | 结构读取、确定性中标匹配、审计和发布 |
-| references/mapping.md | 陌生表头和混合区域的内部映射 |
+| references/semantic-review.md | 正常运行中的结构语义答案契约 |
+| references/mapping.md | 旧 plan/patch 兼容及开发诊断 |
 | references/cross-sheet-relations.md | 汇总表与投标明细表的通用跨表关系 |
 | references/relation-review.md | 非精确项目名称候选的内部复核 |
 | references/award-review.md | 非精确中标名称的用户确认流程 |
@@ -34,7 +35,9 @@ python scripts/excel_ledger.py run <Excel路径> --output <工作区内的结果
 python scripts/excel_ledger.py resolve --state <state.json> --answers <answers.json>
 ```
 
-首次 run 将完整 inspection 保存到内部 `.excel-ledger-work-*` 目录，stdout 只返回有界摘要和 `inspection_path`，退出码3。Agent 以 plan patch 修订表结构和跨表关系，再用 `plan` 命令生成完整 plan。非精确项目关系返回退出码5；非精确中标名称返回退出码4。两者都通过同一 `resolve --state ... --answers ...` 状态机逐批处理。退出码0表示产物已发布，退出码2表示不可恢复错误。
+首次 run 返回 `mapping_required`、`stage=structure`、state、最多3个结构语义问题和完整 `next_command`，退出码3。同一表头结构归为一组判断。Agent 只提交当前问题的列角色、记录布局、项目上下文来源及中标完整性依据，Python 生成并验证 plan。非精确项目关系返回退出码5；非精确中标名称返回退出码4，并明确 `decision_owner=user`。全部通过 `resolve --state ... --answers ...` 继续，无需猜参数或重读完整状态。退出码0表示产物已发布，退出码2表示不可恢复错误。旧 `--plan` 和 `plan --patch` 入口仍兼容，但不能绕过来源边界校验。
+
+结构判断失败最多允许两次，不能解释的区域保留独立复核。额外证据使用返回的 `inspect_command`，每次最多20行、16列，宽表可用 `--columns A:P` 分页。不存在按文件名、城市或 Sheet 名称选择的生产适配器。未知含义仍需模型解释，并排重复业务列等无法无歧义拆分的区域保留复核，不声称任意来源都能自动恢复缺失业务事实。
 
 自动确认限于组内精确名称和原表明确中标状态。安全同行优先作为推荐项，否则按组内名称接近程度推荐；法人和金额只作来源审计。用户可选择推荐项、Other 输入当前组投标名称或“不确定”，最终文件始终由 Python 重建。
 
@@ -42,7 +45,9 @@ python scripts/excel_ledger.py resolve --state <state.json> --answers <answers.j
 
 1.7 增加标准表类型、项目名称主导的跨 Sheet 关系、标段可选细分、项目关系候选复核、紧凑 inspection、plan patch 和依赖预检。旧 plan 未声明 relationships 时继续执行 1.6 单表逻辑；旧版本产物仍可 validate。本仓库尚未接入 Spider 或报告服务，修改代码不等于已部署到 QM/Qwen。
 
-1.7.1 增加 bidder roster 项目覆盖不变量、部分合并/块首项目继承、`bidder_serial`、来源投标块审计及跨块去重保护。映射了项目角色的投标企业若仍无法归属项目，将返回 `mapping_required`，不会进入跨表关系、中标候选或最终发布。候选范围不完整时关系和中标推荐均停止，award-only 表的投标数量只保留为证据。CSV 记录数始终由 CSV 解析器或 `ledger.summary` 返回，不按物理文本行统计。
+1.8 的来源块由原始项目锚点、标段、数量、序号和批次证据产生，不再复制 plan 的 group ID。吞并独立块、截断候选或把有依据的标段列降为 evidence 会在去重之前阻断。`source_blocks` 和 `source_coverage` 保存独立来源行清单，并核验每个企业来源行是否完整提取或进入独立复核。项目上下文冲突不能通过“projectless=0”冒充覆盖完整。award-only 数量不与中标记录数比较，复核队列数使用 `summary.review_record_count`。
+
+本地 answers.json 不构成可信人工身份凭证。中标决定保存 `confirmation_provenance=local_answer_file_not_host_verified`；真正的用户回执校验需要宿主提供可信通道，本仓库没有假装实现该宿主能力。模型没有真实回复时必须保存不确定。
 
 原始业务 Excel、处理结果、缓存和凭据不提交。tests/verify_samples.py 从仓库外读取真实样本，仓库不附带业务数据。
 
