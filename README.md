@@ -1,10 +1,12 @@
 # bidding-excel-normalizer
 
-独立的招投标 Excel 整理 Skill，当前版本 **1.8.1**。输入 XLS/XLSX，通过有界结构语义判断与独立来源分块处理陌生表格，最终交付 final.csv、review_queue.csv、ledger.json。
+独立的招投标 Excel 整理 Skill，当前包版本 **1.8.2**，底层解析器仍为1.8.1。输入 XLS/XLSX，按业务范围解释陌生表格，固定交付 final.csv、review_queue.csv；ledger.json 在内部生成并参与校验。
+
+1.8.2 新增结构化 answer 命令，由 Python 合并答案、保存批次和提交，不再通过 edit_file 修改 JSON 缩进。普通问题一次提交；长答案按字段用 --draft 分段，每次最多2000字符。新增范围判断，默认保留投标企业参与明细及关联汇总；按标题、表头和样例排除其他业务整表，保留范围目标、理由和来源审计。没有投标明细时独立中标资料继续保留；不按城市、固定表名或Sheet序号适配。原单元格读取、分块、企业提取和中标匹配算法保持不变。
 
 2026-09-28 的最小补丁保留1.8.1解析器及会话版本：入口返回固定三项 `workflow.todos`（读取并检查Excel、清洗并整理数据、生成并校验结果），结构、关系、中标确认归入第二项。使用现有 `write_todos` 原样同步；Skill不修改宿主平台代码、模型服务或超时设置。模型已经断流、Skill无法继续运行时，右侧即时停止显示“进行中”仍受宿主机制限制，不能声称仅靠Skill已强制解决。
 
-恢复先执行 `excel_agent.py status --resume --state <已有session.json>`，只读核验输入指纹、当前批次、引擎状态、答案文件和提交回执，再继续当前 `next_command`。只检查不恢复时不加 `--resume`。不会重新 run 或重新分析已提交结构。答案采用简短的局部编辑，避免整份长JSON作为单个工具参数发送。
+恢复先执行 `excel_agent.py status --resume --state <已有session.json>`，只读核验输入指纹、当前批次、引擎状态、答案文件和提交回执，先同步待办，再按当前 answer_command 继续。只检查不恢复时不加 --resume。旧1.8.1会话保持兼容，不会重新 run、插入范围阶段或重新分析已提交结构。
 
 脚本全量扫描来源，收集独立投标块证据、分组、清洗、关联项目并核验来源覆盖；模型只解释列含义、区域布局和表关系，或选择有界项目候选。完整 plan 由 Python 编译，普通运行不要求模型设置分组模式、读源码或编写临时脚本。存在投标列时公司名称始终来自投标列，中标栏不替换、纠正投标全称。
 
@@ -17,6 +19,7 @@
 | scripts/excel_ledger.py | 运行、局部检查、产物校验及读取去重名单 |
 | scripts/ledger_core/ | 结构读取、确定性中标匹配、审计和发布 |
 | references/semantic-review.md | 正常运行中的结构语义答案契约 |
+| references/scope-selection.md | 目标范围、关联资料保留和业务排除审计 |
 | references/agent-protocol.md | 平台接入、响应预算和宿主职责 |
 | references/mapping.md | 旧 plan/patch 兼容及开发诊断 |
 | references/cross-sheet-relations.md | 汇总表与投标明细表的通用跨表关系 |
@@ -38,10 +41,10 @@ python -m pip install -r requirements.txt
 python -B -m unittest discover -s tests
 python scripts/excel_agent.py doctor
 python scripts/excel_agent.py run <Excel路径> --output <任务工作区内的空结果目录>
-# 填写返回的 answer_file，执行 next_command
+# 先同步 workflow.todos；用 answer_command 追加 --id 和 --json 提交语义字段
 ```
 
-平台入口正常交接退出0，由 `kind` 表示结构、项目关系、用户确认或最终结果；错误退出2。默认响应不超过6000字符，完整问题通过 `question --section` 分页；下一步命令、角色与答案文件优先显示。程序生成带 batch_id/state_version 的独立答案文件，拒绝陈旧或跨批次答案，相同答案重试返回当前快照。输出必须指定到任务目录，避免模型事后复制产物。协议及中断恢复边界见 [平台协议](references/agent-protocol.md)。
+平台入口正常交接退出0，由 kind/task_type 表示范围、结构、项目关系、用户确认或最终结果；错误退出2。默认响应不超过6000字符，完整问题通过 question --section 分页。程序管理带 batch_id/state_version 的独立答案文件，拒绝陈旧或跨批次答案，相同答案重试返回当前快照。输出必须指定到任务目录。协议及中断恢复边界见 [平台协议](references/agent-protocol.md)。
 
 底层 `excel_ledger.py` 的原有接口继续兼容：结构交接退出3，项目关系退出5，中标企业退出4，发布退出0，错误退出2。结构每批最多3问、复核最多5问，平台入口可按预算缩小批次。旧 `--plan` 和 `plan --patch` 仍可用但不能绕过来源边界校验。旧产物可只读 validate；未完成状态不能跨解析器版本恢复。
 

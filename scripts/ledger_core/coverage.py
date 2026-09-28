@@ -7,11 +7,27 @@ from .contract import LedgerError
 def validate_source_coverage(ledger: dict) -> dict:
     from .relations import table_identity
     basis = {}
+    scoped_out = {}
+    source_ids = {source["sha256"]: source["id"] for source in ledger["sources"]}
     for source in ledger["mapping"]["sources"]:
         for sheet_index, sheet in enumerate(source["sheets"]):
+            if "scope_exclusion" in sheet:
+                exclusion = sheet["scope_exclusion"]
+                if (sheet["action"] != "skip" or not isinstance(exclusion, dict) or
+                        set(exclusion) != {"goal", "basis"} or
+                        any(not isinstance(v, str) or not v.strip() for v in exclusion.values())):
+                    raise LedgerError("业务范围排除审计无效")
+                scoped_out[source_ids[source["sha256"]], sheet["name"]] = exclusion
             for table_index, table in enumerate(sheet.get("tables", [])):
                 table_id = table.get("table_id") or table_identity(source["sha256"], sheet_index, table_index)
                 basis[table_id] = {item["column"] for item in table.get("column_dispositions", [])}
+    recorded_exclusions = {(item["source_id"], item["sheet"]): item["scope_exclusion"]
+                           for item in ledger.get("skipped_sheets", []) if "scope_exclusion" in item}
+    if scoped_out != recorded_exclusions:
+        raise LedgerError("业务范围排除清单与映射不一致")
+    for item in [*ledger["records"], *ledger["row_audit"], *ledger["source_blocks"], *ledger["issues"]]:
+        if (item.get("source_id"), item.get("sheet")) in scoped_out:
+            raise LedgerError("范围外 Sheet 不应混入提取记录或复核队列")
     groups = {group["id"]: group for group in ledger["groups"]}
     blocks = {block["id"]: block for block in ledger["source_blocks"]}
     if len(blocks) != len(ledger["source_blocks"]):

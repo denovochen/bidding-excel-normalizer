@@ -36,13 +36,15 @@ def semantic_fixture(question: dict) -> dict:
     return answer
 
 
-def verify(path: Path, destination: Path, kind: str, agent_mode: bool = False) -> dict:
+def verify(path: Path, destination: Path, kind: str, agent_mode: bool = False, roster_scope: bool = False) -> dict:
     before = hashlib.sha256(path.read_bytes()).hexdigest()
     entry = ROOT / ("scripts/excel_agent.py" if agent_mode else "scripts/excel_ledger.py")
     command = [sys.executable, "-B", str(entry), "run", str(path),
                "--output", str(destination)]
+    if agent_mode:
+        command.extend(["--scope", "施工投标明细及对应汇总" if roster_scope else "全部招投标资料"])
     totals = {"cli_calls": 0, "response_characters": 0, "largest_response_characters": 0,
-              "structure_questions": 0, "table_relationship_questions": 0,
+              "structure_questions": 0, "scope_questions": 0, "table_relationship_questions": 0,
               "project_questions": 0, "deferred_award_questions": 0}
     call_log = []
     started = time.monotonic()
@@ -78,22 +80,35 @@ def verify(path: Path, destination: Path, kind: str, agent_mode: bool = False) -
         if reply.get("validation_errors"):
             raise AssertionError(reply["validation_errors"])
         answers = {}
-        envelope = json.loads(Path(reply["answer_file"]).read_text(encoding="utf-8")) if agent_mode else None
         for question in reply["questions"]:
             key = question["question_id"]
             if agent_mode:
                 question = dict(question)
                 if reply["kind"] == "mapping_required":
-                    question["task_type"] = detail(reply, question, "task_type")[0]
-                    question["answer_template"] = envelope["answers"][key]
+                    if "task_type" not in question:
+                        question["task_type"] = detail(reply, question, "task_type")[0]
                     sections = (["columns", "project_context_candidates"] if question["task_type"] == "structure"
-                                else ["candidate_bidder_sets", "sources"])
+                                else ["sheets"] if question["task_type"] == "scope" else ["candidate_bidder_sets", "sources"])
                     for section in sections:
                         if section not in question:
                             question[section] = detail(reply, question, section)
+                    if question["task_type"] == "structure":
+                        if "answer_defaults" in question:
+                            question["answer_template"] = {**question["answer_defaults"],
+                                                           "columns": {p["column"]: p["suggested_role"] for p in question["columns"]}}
+                        else:
+                            question["answer_template"] = {item["key"]: item["value"]
+                                                           for item in detail(reply, question, "answer_template")}
                 elif "options" not in question:
                     question["options"] = detail(reply, question, "options")
-            if question.get("task_type") == "structure":
+            if question.get("task_type") == "scope":
+                totals["scope_questions"] += 1
+                # 仅用于用户明确限定施工范围的已知样本夹具，不是生产筛选规则。
+                excluded = {sheet["sheet_id"]: "样本夹具：该表为独立监理/勘察业务，不属于施工范围"
+                            for sheet in question["sheets"]
+                            if roster_scope and any(word in sheet["sheet"] for word in ("监理", "勘察"))}
+                answers[key] = {"exclude": excluded, "basis": "样本夹具：施工及关联汇总" if roster_scope else "全量回归，全部来源保留"}
+            elif question.get("task_type") == "structure":
                 if question.get("previous_error"):
                     raise AssertionError(question["previous_error"])
                 totals["structure_questions"] += 1
@@ -119,18 +134,22 @@ def verify(path: Path, destination: Path, kind: str, agent_mode: bool = False) -
                 answers[key] = "unresolved"
             else:
                 raise AssertionError("未知交接类型")
-        command = shlex.split(reply["next_command"])
-        answers_path = Path(command[command.index("--answers") + 1])
         if agent_mode:
-            envelope["answers"] = answers
-        answers_path.write_text(json.dumps(envelope if agent_mode else answers, ensure_ascii=False), encoding="utf-8")
+            command = shlex.split(reply["answer_command"]) + ["--json", json.dumps(answers, ensure_ascii=False)]
+        else:
+            command = shlex.split(reply["next_command"])
+            answers_path = Path(command[command.index("--answers") + 1])
+            answers_path.write_text(json.dumps(answers, ensure_ascii=False), encoding="utf-8")
     else:
         raise AssertionError("超过100次 CLI 调用预算")
     checked = validate_outputs(destination)
     ledger = json.loads((destination / "ledger.json").read_text(encoding="utf-8"))
     expected_records = {"jiangyin": 1768, "xinhe": 289, "yixing": 10241}
-    if checked["summary"]["record_count"] != expected_records[kind]:
+    if not roster_scope and checked["summary"]["record_count"] != expected_records[kind]:
         raise AssertionError((kind, checked["summary"]))
+    if roster_scope and (not ledger["skipped_sheets"] or any(
+            any(word in record["sheet"] for word in ("监理", "勘察")) for record in ledger["records"])):
+        raise AssertionError("范围外业务未按夹具排除")
     if checked["summary"]["cross_block_deduplication_count"] or ledger["source_coverage"]["unaccounted_bidder_row_count"]:
         raise AssertionError("来源覆盖或跨块去重不变量失败")
     if any(decision["decision"] == "select_bidder" for decision in ledger["resolutions"]):
@@ -153,7 +172,8 @@ def verify(path: Path, destination: Path, kind: str, agent_mode: bool = False) -
             "summary": checked["summary"], "source_coverage": ledger["source_coverage"],
             **totals, "elapsed_seconds": round(time.monotonic() - started, 2), "calls": call_log,
             "selection_policy": "结构语义为测试夹具，项目关系模拟首个候选，所有非精确企业保持不确定",
-            "model_calls": 0, "not_platform_blind_test": True, "agent_protocol": agent_mode}
+            "model_calls": 0, "not_platform_blind_test": True, "agent_protocol": agent_mode,
+            "roster_scope_fixture": roster_scope}
 
 
 def main():
@@ -162,11 +182,15 @@ def main():
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--agent", action="store_true", help="验证平台短响应入口与公开证据分页")
+    parser.add_argument("--roster-scope", action="store_true", help="仅在宜兴测试夹具中限定施工明细及关联汇总")
     args = parser.parse_args()
+    if args.roster_scope and not args.agent:
+        parser.error("--roster-scope 需要 --agent")
     args.output_root.mkdir(parents=True, exist_ok=False)
     reports = []
     for name in ("jiangyin", "xinhe", "yixing"):
-        report = verify(getattr(args, name), args.output_root / name, name, args.agent)
+        report = verify(getattr(args, name), args.output_root / name, name, args.agent,
+                        args.roster_scope and name == "yixing")
         reports.append(report)
         print(json.dumps(report, ensure_ascii=False), flush=True)
     (args.output_root / "workflow-verification.json").write_text(json.dumps(reports, ensure_ascii=False, indent=2), encoding="utf-8")

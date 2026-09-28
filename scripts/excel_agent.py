@@ -18,8 +18,11 @@ from ledger_core.contract import VERSION, LedgerError, stable_id
 from ledger_core.artifacts import digest
 from ledger_core.review import save_state
 from ledger_core.workbook import load_json
+from ledger_core.workflow import DEFAULT_SCOPE, validate_scope_answer
 
+RELEASE_VERSION = "1.8.2"
 DEFAULT_RESPONSE_CHARS = 6000
+MAX_ANSWER_CHARS = 2000
 HANDOFFS = {"mapping_required", "relationship_review_required", "award_review_required"}
 
 
@@ -33,6 +36,7 @@ def workflow_progress(reply: dict, *, paused: bool = False) -> dict:
     completed = kind == "result" and reply.get("validated") is True
     activity = "complete" if completed else "paused" if paused or kind == "error" else "running"
     return {"name": "bidding-excel-normalizer", "schema_version": 1, "step": step,
+            "sync_tool": "write_todos", "sync_before_next_command": True,
             "phase": phase, "activity": activity,
             "todos": [{"content": title, "status": "completed" if completed or index < step else
                        "in_progress" if index == step and activity == "running" else "pending"}
@@ -53,6 +57,7 @@ def checked_status(path: Path, *, resume: bool = False) -> dict:
     if len(state["receipts"]) != state["state_version"] - 1:
         raise LedgerError("提交回执数量与会话版本不一致")
     checks = {"batch": "verified", "committed_batches": len(state["receipts"])}
+    committed_scope = None
     for version in range(1, state["state_version"]):
         batch = stable_id("batch", state["session_id"], version)
         answers = load_json(path.with_name(f"submitted-{version}.json"))
@@ -60,6 +65,8 @@ def checked_status(path: Path, *, resume: bool = False) -> dict:
         receipt = stable_id("answers", json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
         if state["receipts"].get(batch) != receipt:
             raise LedgerError("已提交答案与回执不一致，不能猜测已完成的批次")
+        if "scope_selection" in answers:
+            committed_scope = answers["scope_selection"]
     if snapshot["kind"] == "result":
         checked = engine(["validate", snapshot["output"]])
         if checked["summary"] != snapshot["summary"]:
@@ -73,6 +80,9 @@ def checked_status(path: Path, *, resume: bool = False) -> dict:
             expected = list(inner["source_hashes"].values()) + [x["sha256"] for x in inner.get("failures", [])]
             if not set(state["issued_questions"]) <= set(inner["issued_questions"]):
                 raise LedgerError("引擎问题与当前批次不一致")
+            if committed_scope is not None and (inner.get("scope", {}).get("decision") != committed_scope or
+                    inner["scope"]["goal"] != state.get("scope_summary", {}).get("goal")):
+                raise LedgerError("业务范围与已提交回执不一致，不能恢复")
         else:
             expected = [source["sha256"] for source in inner["plan"]["sources"]]
             if set(state["issued_questions"]).intersection(inner["decisions"]):
@@ -91,6 +101,8 @@ def checked_status(path: Path, *, resume: bool = False) -> dict:
     result["workflow"] = workflow_progress(state["reply"], paused=not resume)
     result["resume_checks"] = checks
     if snapshot["kind"] in HANDOFFS:
+        result["answer_command"] = command("answer", state=path, batch_id=state["batch_id"],
+                                           state_version=state["state_version"])
         result["questions"] = [{"question_id": key, "details_required": True,
                                 "detail_command": command("question", state=path, id=key)}
                                for key in state["issued_questions"]]
@@ -127,8 +139,11 @@ def engine(args: list[str]) -> dict:
 
 def load_session(path: Path) -> dict:
     state = load_json(path)
-    if state.get("protocol_version") != 1 or state.get("parser_version") != VERSION:
+    if state.get("protocol_version") not in {1, 2} or state.get("parser_version") != VERSION:
         raise LedgerError("Agent 会话版本不匹配，请使用创建该会话的 Skill 版本")
+    if state["snapshot"]["kind"] == "result":
+        state["snapshot"]["files"] = ["final.csv", "review_queue.csv"]
+        state["snapshot"]["internal_files"] = ["ledger.json"]
     return state
 
 
@@ -149,6 +164,9 @@ def session_lock(path: Path):
 def brief(question: dict) -> dict:
     result = {key: value for key, value in question.items()
               if key not in {"answer_template", "header_preview", "source_block_examples", "inspect_command"}}
+    if isinstance(question.get("answer_template"), dict):
+        result["answer_defaults"] = {k: v for k, v in question["answer_template"].items()
+                                     if k not in {"columns", "basis"}}
     if "columns" in result:
         result["columns"] = [{key: item[key] for key in ("column", "header", "suggested_role", "samples")
                                if key in item} for item in result["columns"]]
@@ -167,8 +185,13 @@ def save_reply(path: Path, state: dict, reply: dict) -> dict:
     result = {"kind": reply["kind"], "state": str(path), "state_version": version, "batch_id": batch,
               "workflow": workflow_progress(reply)}
     if reply["kind"] == "result":
-        result.update({key: reply[key] for key in ("output", "files", "summary", "checks")})
+        result.update({key: reply[key] for key in ("output", "validated", "summary", "checks")})
+        result["files"] = ["final.csv", "review_queue.csv"]
+        result["internal_files"] = ["ledger.json"]
         result["delivery"] = copy.deepcopy(reply["delivery"])
+        if "scope_summary" in state:
+            result["delivery"]["excluded_sheet_count"] = state["scope_summary"]["excluded_sheet_count"]
+            result["delivery"]["message"] += f"按业务范围排除 {state['scope_summary']['excluded_sheet_count']} 个工作表，原因保留在内部审计。"
         reasons = result["delivery"]["review_reasons"]
         total = len(reasons)
         result["delivery"]["omitted_reason_types"] = 0
@@ -183,15 +206,18 @@ def save_reply(path: Path, state: dict, reply: dict) -> dict:
                        "decision_owner": reply.get("decision_owner", "model"),
                        "remaining_task_count": reply["remaining_task_count"],
                        "answer_file": str(answers_path),
-                       "next_command": command("resolve", state=path, answers=answers_path),
+                       "answer_command": command("answer", state=path, batch_id=batch, state_version=version),
                        "answer_roles": reply.get("answer_roles", []),
                        "validation_errors": reply.get("validation_errors", []), "questions": []})
         selected = []
         for question in reply["questions"]:
             preview = brief(question)
             details = {"question_id": question["question_id"],
-                       "detail_command": command("question", state=path, id=question["question_id"]),
-                       "available_sections": list(question)}
+                       "detail_command": command("question", state=path, id=question["question_id"])}
+            if "task_type" in question:
+                details["task_type"] = question["task_type"]
+            if question.get("task_type") == "scope":
+                details["goal"] = question["goal"]
             if result["decision_owner"] != "user":
                 preview.update(details)
             result["questions"].append(preview)
@@ -214,60 +240,155 @@ def save_reply(path: Path, state: dict, reply: dict) -> dict:
     return result
 
 
-def start(inputs: list[Path], output: Path, response_chars: int) -> dict:
+def start(inputs: list[Path], output: Path, response_chars: int, scope: str | None = DEFAULT_SCOPE) -> dict:
     output = output.expanduser().absolute()
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise LedgerError("输出目录必须不存在或为空")
-    reply = engine(["run", *[str(path) for path in inputs], "--output", str(output)])
+    if scope is not None and (not isinstance(scope, str) or not scope.strip() or len(scope) > 500):
+        raise LedgerError("业务范围须为1到500字的目标描述")
+    reply = engine(["run", *[str(path) for path in inputs], "--output", str(output),
+                    *(["--scope", scope] if scope is not None else [])])
     directory = output.parent / (".excel-agent-" + uuid.uuid4().hex)
     directory.mkdir()
-    state = {"protocol_version": 1, "parser_version": VERSION, "session_id": uuid.uuid4().hex,
+    state = {"protocol_version": 2, "parser_version": VERSION, "session_id": uuid.uuid4().hex,
              "state_version": 0, "response_chars": response_chars, "receipts": {}}
     return save_reply(directory / "session.json", state, reply)
 
 
 def submit(path: Path, answers_path: Path) -> dict:
     with session_lock(path):
+        return _submit_payload(path, load_session(path), load_json(answers_path))
+
+
+def _submit_payload(path: Path, state: dict, payload: dict) -> dict:
+    if (not isinstance(payload, dict) or set(payload) != {"batch_id", "state_version", "answers"} or
+            not isinstance(payload["answers"], dict) or type(payload["state_version"]) is not int):
+        raise LedgerError("答案须包含 batch_id、state_version、answers")
+    batch = payload["batch_id"]
+    if not isinstance(batch, str):
+        raise LedgerError("batch_id 必须是字符串")
+    receipt = stable_id("answers", json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
+    if batch in state["receipts"]:
+        if state["receipts"][batch] != receipt:
+            raise LedgerError("该批次已提交，不能用不同答案覆盖")
+        return state["snapshot"]
+    if state.get("inflight"):
+        raise LedgerError("上次引擎提交中断；请核对会话与引擎状态，不自动重复提交")
+    if batch != state["batch_id"] or payload["state_version"] != state["state_version"]:
+        raise LedgerError("答案批次已过期；运行 status 获取当前批次")
+    if not payload["answers"] or not set(payload["answers"]) <= set(state["issued_questions"]):
+        raise LedgerError("只能提交当前批次问题；历史答案由程序保存")
+    if state["reply"]["kind"] not in HANDOFFS:
+        raise LedgerError("会话已结束，无待提交的问题")
+    scope_question = next((q for q in state["reply"].get("questions", [])
+                           if q.get("task_type") == "scope" and q["question_id"] in payload["answers"]), None)
+    if scope_question:
+        validate_scope_answer(scope_question, payload["answers"][scope_question["question_id"]])
+    if state["reply"]["kind"] == "relationship_review_required":
+        questions = {q["question_id"]: q for q in state["reply"]["questions"]}
+        for key, value in payload["answers"].items():
+            if value == "unresolved" or isinstance(value, dict) and value.get("value") == "unresolved":
+                continue
+            if (not isinstance(value, dict) or set(value) != {"value", "basis", "evidence"} or
+                    not isinstance(value["value"], str) or not isinstance(value["basis"], str) or
+                    not value["basis"].strip() or len(value["basis"]) > 1000):
+                raise LedgerError("项目关系选择须包含 value、basis 和 evidence；无法确认用 unresolved")
+            required = questions[key]["evidence_refs"].get(value["value"])
+            if not required or value["evidence"] != required:
+                raise LedgerError("项目关系必须引用所选候选 evidence_refs 中的汇总与名册来源")
+    engine_answers = path.with_name(f"submitted-{state['state_version']}.json")
+    save_state(engine_answers, payload["answers"])
+    state["inflight"] = {"batch_id": batch, "digest": receipt}
+    save_state(path, state)
+    reply = engine(["resolve", "--state", state["reply"]["state"], "--answers", str(engine_answers)])
+    if scope_question:
+        state["scope_summary"] = {"goal": scope_question["goal"],
+                                  "excluded_sheet_count": len(payload["answers"][scope_question["question_id"]]["exclude"])}
+    state["receipts"][batch] = receipt
+    return save_reply(path, state, reply)
+
+
+def _merge_answer(template, patch):
+    if not isinstance(template, dict) or not isinstance(patch, dict):
+        return copy.deepcopy(patch)
+    if patch.get("action") == "review":
+        if set(patch) != {"action", "basis"}:
+            raise LedgerError("review 只接受 action 和 basis")
+        return copy.deepcopy(patch)
+    allowed = set(template) | ({"header_rows"} if "columns" in template else set())
+    if set(patch) - allowed:
+        raise LedgerError("答案包含当前模板之外的字段")
+    result = copy.deepcopy(template)
+    for key, value in patch.items():
+        if key in {"columns", "exclude"}:
+            if not isinstance(value, dict):
+                raise LedgerError(f"{key} 必须是对象")
+            if key == "columns" and set(value) - set(template[key]):
+                raise LedgerError("列标不属于当前问题")
+            result[key].update(value)
+            if key == "exclude":
+                result[key] = {label: reason for label, reason in result[key].items() if reason is not None}
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def answer(path: Path, batch: str, version: int, question_id: str | None, patch, *, draft: bool = False) -> dict:
+    """Apply semantic fields, never text replacements; commit bounded current answers."""
+    patches = {question_id: patch} if question_id is not None else patch
+    if not isinstance(patches, dict) or not patches:
+        raise LedgerError("未指定 --id 时，--json 必须是非空的 question_id 到答案的对象")
+    with session_lock(path):
         state = load_session(path)
-        payload = load_json(answers_path)
-        if (set(payload) != {"batch_id", "state_version", "answers"} or
-                not isinstance(payload["answers"], dict) or type(payload["state_version"]) is not int):
-            raise LedgerError("答案须包含 batch_id、state_version、answers，直接填写返回的 answer_file")
-        batch = payload["batch_id"]
-        if not isinstance(batch, str):
-            raise LedgerError("batch_id 必须是字符串")
-        digest = stable_id("answers", json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
+        if version < 1 or batch != stable_id("batch", state["session_id"], version):
+            raise LedgerError("答案批次与版本不匹配")
         if batch in state["receipts"]:
-            if state["receipts"][batch] != digest:
+            payload = {"batch_id": batch, "state_version": version,
+                       "answers": load_json(path.with_name(f"submitted-{version}.json"))}
+            if draft or any(key not in payload["answers"] or
+                            _merge_answer(payload["answers"][key], value) != payload["answers"][key]
+                            for key, value in patches.items()):
                 raise LedgerError("该批次已提交，不能用不同答案覆盖")
-            return state["snapshot"]
-        if state.get("inflight"):
-            raise LedgerError("上次引擎提交中断；请核对会话与引擎状态，不自动重复提交")
-        if batch != state["batch_id"] or payload["state_version"] != state["state_version"]:
-            raise LedgerError("答案批次已过期；运行 status 获取当前批次")
-        if not payload["answers"] or not set(payload["answers"]) <= set(state["issued_questions"]):
-            raise LedgerError("只能提交当前批次问题；历史答案由程序保存")
-        if state["reply"]["kind"] not in HANDOFFS:
-            raise LedgerError("会话已结束，无待提交的问题")
-        if state["reply"]["kind"] == "relationship_review_required":
-            questions = {q["question_id"]: q for q in state["reply"]["questions"]}
-            for key, answer in payload["answers"].items():
-                if answer == "unresolved" or isinstance(answer, dict) and answer.get("value") == "unresolved":
-                    continue
-                if (not isinstance(answer, dict) or set(answer) != {"value", "basis", "evidence"} or
-                        not isinstance(answer["value"], str) or not isinstance(answer["basis"], str) or
-                        not answer["basis"].strip() or len(answer["basis"]) > 1000):
-                    raise LedgerError("项目关系选择须包含 value、basis 和 evidence；无法确认用 unresolved")
-                required = questions[key]["evidence_refs"].get(answer["value"])
-                if not required or answer["evidence"] != required:
-                    raise LedgerError("项目关系必须引用所选候选 evidence_refs 中的汇总与名册来源")
-        engine_answers = path.with_name(f"submitted-{state['state_version']}.json")
-        save_state(engine_answers, payload["answers"])
-        state["inflight"] = {"batch_id": batch, "digest": digest}
-        save_state(path, state)
-        reply = engine(["resolve", "--state", state["reply"]["state"], "--answers", str(engine_answers)])
-        state["receipts"][batch] = digest
-        return save_reply(path, state, reply)
+            return _submit_payload(path, state, payload)
+        if batch != state["batch_id"] or version != state["state_version"] or state.get("inflight"):
+            raise LedgerError("批次过期或上次提交中断；先用 status --resume 核验，不重新 run")
+        questions = {q["question_id"]: q for q in state["reply"].get("questions", [])
+                     if q["question_id"] in state["issued_questions"]}
+        if not set(patches) <= set(questions):
+            raise LedgerError("问题不属于当前批次")
+        answers_path = Path(state["snapshot"]["answer_file"])
+        pending = load_json(answers_path)
+        if pending.get("batch_id") != batch or pending.get("state_version") != version:
+            raise LedgerError("答案文件与当前批次不一致")
+        answers = {}
+        for key, fields in patches.items():
+            question = questions[key]
+            original = question.get("answer_template", "unresolved")
+            value = _merge_answer(pending["answers"].get(key, original), fields)
+            if isinstance(value, dict) and "basis" in value:
+                if not isinstance(value["basis"], str) or len(value["basis"]) > 256:
+                    raise LedgerError("basis 须为不超过256字的依据")
+            if not draft:
+                if isinstance(original, dict):
+                    if (not isinstance(value, dict) or not isinstance(value.get("basis"), str) or
+                            not value["basis"].strip() or value["basis"] == original.get("basis")):
+                        raise LedgerError("提交前必须填写具体 basis；需要分段填写时使用 --draft")
+                if question.get("task_type") == "scope":
+                    validate_scope_answer(question, value)
+                if isinstance(value, dict) and value.get("action") == "interpret":
+                    roles = value.get("columns")
+                    if not isinstance(roles, dict) or any(role not in state["reply"]["answer_roles"] for role in roles.values()):
+                        raise LedgerError("仍有未解释或无效列角色；可继续 --draft 或提交 review")
+            answers[key] = value
+        if draft:
+            pending["answers"].update(answers)
+            save_state(answers_path, pending)
+            return {"kind": "answer_saved", "state": str(path), "batch_id": batch,
+                    "state_version": version, "question_ids": list(answers),
+                    "workflow": workflow_progress(state["reply"]),
+                    "answer_command": command("answer", state=path, batch_id=batch, state_version=version, id=question_id)}
+        return _submit_payload(path, state, {"batch_id": batch, "state_version": version,
+                                            "answers": answers})
 
 
 def question_page(path: Path, question_id: str, section: str | None, offset: int, limit: int) -> dict:
@@ -285,7 +406,9 @@ def question_page(path: Path, question_id: str, section: str | None, offset: int
                   "sections": {key: {"type": type(value).__name__, "size": len(value) if isinstance(value, (dict, list, str)) else 1}
                                for key, value in question.items()},
                   "next_command": command("question", state=path, id=question_id,
-                                          section="columns" if "columns" in question else "question")}
+                                          section="columns" if "columns" in question else
+                                          "sheets" if "sheets" in question else
+                                          "candidate_bidder_sets" if "candidate_bidder_sets" in question else "question")}
         if "inspect_command" in question:
             result["inspect_command"] = question["inspect_command"]
             result["inspect_limits"] = {"rows": 20, "columns": 16}
@@ -328,7 +451,7 @@ def inspect_page(path: Path, region_id: str, start_row: int, count: int, columns
     if reply.get("stage") != "structure":
         raise LedgerError("结构补证据仅适用于结构阶段")
     regions = [region for q in reply["questions"] if q["question_id"] in state["issued_questions"]
-               for region in q.get("regions", [])]
+               for region in q.get("regions", [r for sheet in q.get("sheets", []) for r in sheet["regions"]])]
     region = next((item for item in regions if item["id"] == region_id), None)
     if not region or not region["start"] <= start_row <= region["end"] or not 1 <= count <= 20:
         raise LedgerError("区域和起始行必须属于当前问题，count 须为1到20")
@@ -357,14 +480,21 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("inputs", nargs="+", type=Path)
     run.add_argument("--output", required=True, type=Path)
     run.add_argument("--response-chars", type=int, default=DEFAULT_RESPONSE_CHARS)
+    run.add_argument("--scope", default=DEFAULT_SCOPE, help="业务目标；默认投标明细及关联汇总，不按Sheet位置筛选")
     sub.add_parser("doctor")
-    for action in ("status", "resolve", "question", "inspect"):
+    for action in ("status", "resolve", "answer", "question", "inspect"):
         child = sub.add_parser(action)
         child.add_argument("--state", type=Path, required=True)
         if action == "status":
             child.add_argument("--resume", action="store_true", help="核验成功后显示当前阶段恢复执行；不重新 run/resolve")
         elif action == "resolve":
             child.add_argument("--answers", type=Path, required=True)
+        elif action == "answer":
+            child.add_argument("--batch-id", required=True)
+            child.add_argument("--state-version", type=int, required=True)
+            child.add_argument("--id", help="单问题ID；省略时 --json 为当前问题ID到答案的映射")
+            child.add_argument("--json", required=True, dest="answer_json")
+            child.add_argument("--draft", action="store_true", help="分段保存字段，不提交本批次")
         elif action == "question":
             child.add_argument("--id", required=True)
             child.add_argument("--section")
@@ -379,17 +509,25 @@ def main(argv: list[str] | None = None) -> int:
         args = parser.parse_args(argv)
         if args.action == "doctor":
             result = engine(["doctor"])
+            result["skill_version"] = RELEASE_VERSION
+            result["parser_version"] = VERSION
             result["workflow"] = workflow_progress(result)
         elif args.action == "run":
             if not 4000 <= args.response_chars <= 12000:
                 raise LedgerError("response-chars 须为4000到12000")
-            result = start(args.inputs, args.output, args.response_chars)
+            result = start(args.inputs, args.output, args.response_chars, args.scope)
         else:
             args.state = args.state.expanduser().resolve(strict=True)
             if args.action == "status":
                 result = checked_status(args.state, resume=args.resume)
             elif args.action == "resolve":
                 result = submit(args.state, args.answers)
+            elif args.action == "answer":
+                if len(args.answer_json) > MAX_ANSWER_CHARS:
+                    raise LedgerError("单次答案最多2000字符；按字段分段使用 --draft，最后一次去掉 --draft 提交")
+                value = json.loads(args.answer_json)
+                encoded(value)  # Reject NaN/Infinity before persisting a draft.
+                result = answer(args.state, args.batch_id, args.state_version, args.id, value, draft=args.draft)
             elif args.action == "question":
                 if args.offset < 0 or not 1 <= args.limit <= 20:
                     raise LedgerError("offset 不能为负数，limit 须为1到20")

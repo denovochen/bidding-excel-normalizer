@@ -4,18 +4,16 @@
 
 每个问题代表一组表头结构相同的区域，`regions` 列出来源，`columns` 给出列头、少量样例和候选角色。确认语义适用于所列区域后才接受。需要补证据时用 `inspect_command`，无法解释就按 `review_answer` 留待复核。
 
-填写返回的 `answer_file`，保留批次外壳；下面示例是其 `answers` 成员。模板已由程序写入该文件。问题摘要不足时使用 `detail_command` 的字段索引查看 columns、project_context_candidates 等证据：
+通过返回的 `answer_command --id <question_id> --json '<答案>'` 提交，程序合并模板并直接推进。下面展示单个答案对象，不包含批次外壳或问题ID；只需提交模板中需要补充/修正的字段及具体 basis。不要手工编辑答案文件。问题摘要不足时用 question 分页读取 columns、answer_template、project_context_candidates 等证据：
 
 ```json
 {
-  "structure_脚本提供的ID": {
     "action": "interpret",
     "columns": {"A": "project_name", "B": "bidder_name", "C": "award_name", "D": "evidence"},
     "record_layout": "bidder_rows",
     "project_context_columns": [],
     "award_completeness": "complete",
     "basis": "区域逐组列出全部投标企业及最终中标结果；D列是验收日期"
-  }
 }
 ```
 

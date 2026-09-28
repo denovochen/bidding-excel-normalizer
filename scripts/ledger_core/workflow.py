@@ -21,6 +21,47 @@ from .artifacts import publish
 BATCH_SIZE = 3
 MAX_RESPONSE_CHARS = 24000
 MAX_ATTEMPTS = 2
+DEFAULT_SCOPE = "投标企业参与明细及其关联的项目、招标和中标汇总；无投标明细时保留独立中标资料"
+
+
+def _sheet_id(book, sheet):
+    return stable_id("sheet", book.sha256, sheet.index)
+
+
+def _scope_question(state, books):
+    sheets = []
+    for book in books:
+        for sheet in book.sheets:
+            regions = [r for r in state["regions"] if r["source_id"] == book.source_id and r["sheet_index"] == sheet.index]
+            if not regions:
+                continue
+            sheets.append({"sheet_id": _sheet_id(book, sheet), "source_file": book.path.name,
+                           "sheet": sheet.name, "region_count": len(regions),
+                           "regions": [{k: r[k] for k in ("id", "start", "end")} for r in regions],
+                           "titles": [" / ".join(text(sheet.raw(row, col).value)[:120]
+                                                 for col in sheet.populated_columns_by_row.get(row, [])[:4])
+                                      for row in sheet.row_numbers[:3] if row < regions[0]["start"]],
+                           "headers": list(dict.fromkeys(p["header"] for r in regions for p in r["columns"])),
+                           "project_samples": [p["samples"] for r in regions for p in r["columns"]
+                                               if p["suggested_role"] in {"project_name", "lot_name"}][:3]})
+    return {"question_id": "scope_selection", "task_type": "scope", "owner": "model",
+            "goal": state["scope"]["goal"], "sheets": sheets,
+            "answer_template": {"exclude": {}, "basis": ""},
+            "previous_error": state["errors"].get("scope_selection"),
+            "instruction": "仅排除有证据不属于目标范围的整表，以 sheet_id:原因 填入 exclude；其余保留。混合业务或相关性不清楚时保留，不按位置或缺少投标列排除。"}
+
+
+def validate_scope_answer(question, answer):
+    if (not isinstance(answer, dict) or set(answer) != {"exclude", "basis"} or
+            not isinstance(answer["exclude"], dict) or not isinstance(answer["basis"], str) or
+            not answer["basis"].strip()):
+        raise LedgerError("范围答案必须包含 exclude 对象和非空 basis")
+    available = {s["sheet_id"] for s in question["sheets"]}
+    if not set(answer["exclude"]) <= available or (available and set(answer["exclude"]) == available):
+        raise LedgerError("排除项必须来自本次范围清单，且至少保留一个非空 Sheet")
+    if any(not isinstance(reason, str) or not reason.strip() or len(reason) > 256
+           for reason in answer["exclude"].values()):
+        raise LedgerError("每个排除项必须有不超过256字的具体原因")
 
 
 def command(name: str, **paths) -> str:
@@ -258,6 +299,12 @@ def _plan(state, books) -> dict:
     for book in books:
         sheets = []
         for sheet in book.sheets:
+            reason = state.get("scope", {}).get("decision", {}).get("exclude", {}).get(_sheet_id(book, sheet))
+            if reason:
+                sheets.append({"name": sheet.name, "action": "skip",
+                               "scope_exclusion": {"goal": state["scope"]["goal"], "basis": reason},
+                               "reason": f"业务范围排除；目标：{state['scope']['goal']}；依据：{reason}"})
+                continue
             regions = [region for region in state["regions"] if region["source_id"] == book.source_id and region["sheet_index"] == sheet.index]
             if not regions:
                 sheets.append({"name": sheet.name, "action": "skip", "reason": "空白工作表"})
@@ -312,16 +359,22 @@ def _relationship_questions(state, plan) -> list[dict]:
 
 
 def handoff(state: dict, books) -> dict:
+    scope_pending = "scope" in state and "decision" not in state["scope"]
+    excluded = state.get("scope", {}).get("decision", {}).get("exclude", {})
     cohorts = {}
     for region in state["regions"]:
+        book, sheet = _book_sheet(books, region)
+        if _sheet_id(book, sheet) in excluded:
+            continue
         if region["cohort"] not in state["interpretations"]:
             cohorts.setdefault(region["cohort"], []).append(region)
-    questions = [_question(key, regions, books, state) for key, regions in list(cohorts.items())[:BATCH_SIZE]]
-    if not cohorts:
+    questions = ([_scope_question(state, books)] if scope_pending else
+                 [_question(key, regions, books, state) for key, regions in list(cohorts.items())[:BATCH_SIZE]])
+    if not cohorts and not scope_pending:
         plan = _plan(state, books)
         questions = [question for question in _relationship_questions(state, plan)
                      if question["question_id"] not in state["connections"]]
-    remaining = len(cohorts) if cohorts else len(questions)
+    remaining = 1 if scope_pending else len(cohorts) if cohorts else len(questions)
     selected = []
     for question in questions[:BATCH_SIZE]:
         if selected and len(json.dumps(selected + [question], ensure_ascii=False)) > MAX_RESPONSE_CHARS - 3000:
@@ -338,7 +391,7 @@ def handoff(state: dict, books) -> dict:
     return result
 
 
-def start(inputs, books, failures, output) -> dict:
+def start(inputs, books, failures, output, scope=None) -> dict:
     directory = create_work_directory(output)
     inspection = inspect_workbooks(books, failures)
     inspection_path = directory / "inspection.json"
@@ -350,6 +403,10 @@ def start(inputs, books, failures, output) -> dict:
              "failures": failures, "output": str(output.absolute()), "regions": regions,
              "interpretations": {}, "compiled_tables": {}, "connections": {}, "errors": {}, "attempts": {},
              "state_path": str(directory / "structure.json")}
+    if scope is not None:
+        if not isinstance(scope, str) or not scope.strip() or len(scope) > 500:
+            raise LedgerError("业务范围须为1到500字的目标描述")
+        state["scope"] = {"goal": scope}
     reply = handoff(state, books)
     # 旧 plan 客户端仍可读取完整 inspection，正常流程使用 questions。
     reply["inspection"] = {"inspection_path": str(inspection_path),
@@ -417,9 +474,14 @@ def resume(path: Path, state: dict, answers: dict) -> dict:
     if not isinstance(answers, dict) or set(answers) - set(state["issued_questions"]):
         raise LedgerError("结构答案只能引用本批已返回的问题")
     for key, answer in answers.items():
-        regions = [region for region in state["regions"] if region["cohort"] == key]
+        excluded = state.get("scope", {}).get("decision", {}).get("exclude", {})
+        regions = [region for region in state["regions"] if region["cohort"] == key and
+                   _sheet_id(*_book_sheet(books, region)) not in excluded]
         try:
-            if regions:
+            if key == "scope_selection" and "scope" in state and "decision" not in state["scope"]:
+                validate_scope_answer(_scope_question(state, books), answer)
+                state["scope"]["decision"] = copy.deepcopy(answer)
+            elif regions:
                 if isinstance(answer, dict) and answer.get("action") == "review":
                     if set(answer) != {"action", "basis"} or not isinstance(answer["basis"], str) or not answer["basis"].strip():
                         raise LedgerError("review 必须提供具体 basis")
@@ -450,7 +512,7 @@ def resume(path: Path, state: dict, answers: dict) -> dict:
                 reason = "两次结构判断未通过来源约束: " + str(exc)
                 state["interpretations"][key] = {"action": "interpret", "basis": reason}
                 _quarantine_failed_regions(state, regions, answer, books, reason)
-            elif not regions and state["attempts"][key] >= MAX_ATTEMPTS:
+            elif not regions and key != "scope_selection" and state["attempts"][key] >= MAX_ATTEMPTS:
                 save_state(path, state)
                 raise LedgerError("表关系答案连续两次不符合候选契约；可保留原 state 修正，无产物发布")
     reply = handoff(state, books)

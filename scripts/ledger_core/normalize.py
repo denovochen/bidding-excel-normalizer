@@ -740,7 +740,9 @@ def build_outputs(books: list[Workbook], plan: dict[str, Any], alias_payload: di
         for sheet, spec in zip(book.sheets, source["sheets"]):
             if spec["action"] == "skip":
                 skipped.append({"source_id": book.source_id, "sheet": sheet.name, "reason": spec["reason"]})
-                if sheet.row_numbers:
+                if "scope_exclusion" in spec:
+                    skipped[-1]["scope_exclusion"] = dict(spec["scope_exclusion"])
+                if sheet.row_numbers and "scope_exclusion" not in spec:
                     issues.append(_issue("SOURCE_REGION_SKIPPED", "非空工作表未解析，已转入复核", None,
                                          standalone=True, source_id=book.source_id, source_file=book.path.name,
                                          sheet=sheet.name, start_row=min(sheet.row_numbers), end_row=max(sheet.row_numbers),

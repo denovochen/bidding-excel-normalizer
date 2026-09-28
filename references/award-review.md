@@ -18,10 +18,10 @@ ask_user_question({"questions": result.questions})
 
 名称评分并列时不设置推荐项，问题保留少量有界候选和“不确定”，不确定排在首项；候选排序不代表证据更强。支持不预选的宿主应不预选，始终等待真实用户提交。超预算问题标记 `details_required` 时，先按字段分页取得原始 question/options，再展示，不能让用户回答仅含索引的问题。
 
-每批最多5个问题，平台响应可能按预算进一步缩小批次。工具返回后，将答案对象保存到返回的 `answer_file.answers`，保留 batch_id/state_version；不要改写公司别名或替用户选择。执行返回的 `next_command`。不累计历史答案。
+每批最多5个问题，平台响应可能按预算进一步缩小批次。真实回复到达后，用 answer_command 追加 --id 当前问题ID、--json 选择值提交；不编辑答案文件，不改写公司别名或替用户选择。answer 直接推进，每次先同步 workflow.todos。剩余真实回复按新批次返回的同一问题ID继续提交，不把旧批次答案复制进去。
 
 - 再次返回 `award_review_required`：继续调用提问工具。`validation_errors` 非空时，简短说明对应输入未唯一匹配当前组，然后重问返回的问题。
-- 返回 `result`：只交付最终三个文件。
+- 返回 `result`：只交付 final.csv、review_queue.csv；ledger.json 留作内部审计。
 - 返回 `error`：如实说明失败，不修改 state 或已发布目录。
 
 Other 文本仅能唯一匹配当前招标组已有投标名称。找不到或同时命中多家时保持待确认，绝不新增企业。用户选择“不确定”后不再重问，该组继续保留在最终 `review_queue.csv`。

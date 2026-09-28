@@ -8,7 +8,7 @@
 
 主工程与增做/追加工程不能直接等同。同名同年度的不同来源块，必须有唯一项目编号或实施主体等区分依据；不能选第一个。脚本标记 selection_blockers 的候选不可提交，全部候选均受阻时直接保留复核，不强迫模型在错误候选中选择。
 
-这是内部结构复核，不默认向用户展示。将选择保存到返回的 answer_file.answers，保留批次信息；下例仅为 answers 成员：
+这是内部结构复核，不默认向用户展示。使用返回的 answer_command，追加 --id 当前问题ID 和 --json 答案；下例中只将问题ID对应的值传给 --json，不编辑答案文件：
 
 ```json
 {
@@ -28,11 +28,11 @@
 }
 ```
 
-选择项目时须填写非空 basis，并原样引用该候选的 `evidence_refs`，不能用其他项目单元格替代。引用存在只证明来源可追溯，不自动证明语义正确。然后执行返回的 `next_command`。
+选择项目时须填写非空 basis，并原样引用该候选的 `evidence_refs`，不能用其他项目单元格替代。引用存在只证明来源可追溯，不自动证明语义正确。answer 自动提交并返回下一批，不额外执行旧 resolve；先同步 workflow.todos。
 
 - 再次返回 `relationship_review_required`：继续处理下一批。
 - 返回 `award_review_required`：转入 [中标企业确认](award-review.md)。
-- 返回 `result`：交付最终三个文件。
+- 返回 `result`：只交付 final.csv、review_queue.csv；ledger.json 留作内部审计。
 - 返回 `error`：如实说明，不修改 state、原 Excel 或已发布目录。
 
 关系决定由 Python 校验并写入 `ledger.relationship_resolutions`，新模型决定保存 actor=model、basis=model_selection 及候选证据；不会标为用户确认。模型不直接修改项目、企业或中标状态。

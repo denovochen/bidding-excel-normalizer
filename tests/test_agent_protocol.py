@@ -36,7 +36,7 @@ class AgentProtocolTests(unittest.TestCase):
         return path
 
     def run_start(self, wide=False, budget=6000):
-        return agent.start([self.book(wide)], self.root / "result", budget)
+        return agent.start([self.book(wide)], self.root / "result", budget, scope=None)
 
     def answers(self, reply):
         path = Path(reply["answer_file"])
@@ -107,6 +107,7 @@ class AgentProtocolTests(unittest.TestCase):
         reply = self.run_start()
         state = Path(reply["state"])
         old = load_json(state)
+        old["protocol_version"] = 1
         old["snapshot"].pop("workflow")
         state.write_text(json.dumps(old), encoding="utf-8")
         self.assertEqual(len(agent.checked_status(state)["workflow"]["todos"]), 3)
@@ -220,7 +221,7 @@ class AgentProtocolTests(unittest.TestCase):
         source = self.root / "跨表.xlsx"
         workbook.save(source)
         workbook.close()
-        reply = agent.start([source], self.root / "relation-output", 6000)
+        reply = agent.start([source], self.root / "relation-output", 6000, scope=None)
         while reply["kind"] == "mapping_required":
             path = Path(reply["answer_file"])
             payload = load_json(path)

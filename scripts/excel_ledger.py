@@ -33,6 +33,7 @@ def main(argv: list[str] | None = None, *, emit=None) -> int:
     run.add_argument("inputs", type=Path, nargs="+")
     run.add_argument("--plan", type=Path, help="Agent 内部准备的可选结构映射")
     run.add_argument("--output", type=Path, help="省略时创建 outputs/excel-ledger-<唯一ID>")
+    run.add_argument("--scope", help="先按业务目标筛选 Sheet；不传则保留原全量流程")
     run.add_argument("--progress", action="store_true", help="可选：输出脚本实际阶段日志，不规定宿主进度计划")
     inspect = commands.add_parser("inspect", help="只读展示结构和建议映射，输出 JSON 到 stdout")
     inspect.add_argument("inputs", type=Path, nargs="*")
@@ -205,7 +206,7 @@ def main(argv: list[str] | None = None, *, emit=None) -> int:
                 else:
                     if books:
                         output = args.output or Path.cwd() / "outputs" / ("excel-ledger-" + uuid.uuid4().hex)
-                        result = workflow.start(args.inputs, books, source_failures, output)
+                        result = workflow.start(args.inputs, books, source_failures, output, scope=args.scope)
                         respond(result)
                         return 3
                     plan = inspect_workbooks(books, source_failures)["suggested_plan"]

@@ -866,9 +866,16 @@ def validate_plan(plan: dict[str, Any], books: list[Workbook]) -> None:
         if not isinstance(source["sheets"], list) or len(source["sheets"]) != len(book.sheets):
             raise LedgerError("映射必须逐一覆盖所有 Sheet")
         for spec, sheet in zip(source["sheets"], book.sheets):
-            _keys(spec, {"name", "action", "reason", "tables", "ignored_rows", "review_regions"}, {"name", "action"})
+            _keys(spec, {"name", "action", "reason", "tables", "ignored_rows", "review_regions", "scope_exclusion"}, {"name", "action"})
             if spec["name"] != sheet.name:
                 raise LedgerError("映射 Sheet 名称/顺序不一致")
+            if "scope_exclusion" in spec:
+                exclusion = spec["scope_exclusion"]
+                if (spec["action"] != "skip" or not isinstance(exclusion, dict) or
+                        set(exclusion) != {"goal", "basis"} or
+                        any(not isinstance(exclusion[key], str) or not exclusion[key].strip() or
+                            len(exclusion[key]) > limit for key, limit in (("goal", 500), ("basis", 256)))):
+                    raise LedgerError("业务范围排除必须是 skip，并包含有界的 goal 和 basis")
             if spec["action"] == "needs_mapping":
                 raise MappingRevisionRequired(f"{sheet.name} 尚需结构审阅", {
                     "source": book.path.name, "sheet": sheet.name,
