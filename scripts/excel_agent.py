@@ -10,15 +10,91 @@ import shlex
 import sys
 import uuid
 from contextlib import contextmanager
+from collections import Counter
 from pathlib import Path
 
 import excel_ledger
 from ledger_core.contract import VERSION, LedgerError, stable_id
+from ledger_core.artifacts import digest
 from ledger_core.review import save_state
 from ledger_core.workbook import load_json
 
 DEFAULT_RESPONSE_CHARS = 6000
 HANDOFFS = {"mapping_required", "relationship_review_required", "award_review_required"}
+
+
+def workflow_progress(reply: dict, *, paused: bool = False) -> dict:
+    """Project actual engine handoffs onto the three host todo items."""
+    kind = reply.get("kind")
+    step = 3 if kind == "result" else 2 if kind in HANDOFFS else 1
+    phase = reply.get("stage") or reply.get("batch_task_type") or kind
+    if kind == "mapping_required" and reply.get("questions"):
+        phase = reply["questions"][0].get("task_type", phase)
+    completed = kind == "result" and reply.get("validated") is True
+    activity = "complete" if completed else "paused" if paused or kind == "error" else "running"
+    return {"name": "bidding-excel-normalizer", "schema_version": 1, "step": step,
+            "phase": phase, "activity": activity,
+            "todos": [{"content": title, "status": "completed" if completed or index < step else
+                       "in_progress" if index == step and activity == "running" else "pending"}
+                      for index, title in enumerate(excel_ledger.PROGRESS_TITLES, 1)]}
+
+
+def checked_status(path: Path, *, resume: bool = False) -> dict:
+    """Verify a resume point without replaying run/resolve or modifying answers."""
+    state = load_session(path)
+    if path.with_suffix(".lock").exists() or state.get("inflight"):
+        raise LedgerError("提交仍在运行或上次提交中断；先核对引擎状态，不自动重新 run/resolve")
+    snapshot = state["snapshot"]
+    if (type(state["state_version"]) is not int or state["state_version"] < 1 or
+            Path(snapshot["state"]).resolve() != path.resolve() or
+            snapshot["batch_id"] != state["batch_id"] or snapshot["state_version"] != state["state_version"] or
+            state["batch_id"] != stable_id("batch", state["session_id"], state["state_version"])):
+        raise LedgerError("会话快照与当前批次不一致，不能恢复")
+    if len(state["receipts"]) != state["state_version"] - 1:
+        raise LedgerError("提交回执数量与会话版本不一致")
+    checks = {"batch": "verified", "committed_batches": len(state["receipts"])}
+    for version in range(1, state["state_version"]):
+        batch = stable_id("batch", state["session_id"], version)
+        answers = load_json(path.with_name(f"submitted-{version}.json"))
+        payload = {"batch_id": batch, "state_version": version, "answers": answers}
+        receipt = stable_id("answers", json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
+        if state["receipts"].get(batch) != receipt:
+            raise LedgerError("已提交答案与回执不一致，不能猜测已完成的批次")
+    if snapshot["kind"] == "result":
+        checked = engine(["validate", snapshot["output"]])
+        if checked["summary"] != snapshot["summary"]:
+            raise LedgerError("已发布产物与会话摘要不一致")
+        checks["artifacts"] = "verified"
+    else:
+        inner = load_json(Path(state["reply"]["state"]))
+        if inner.get("parser_version") != state["parser_version"]:
+            raise LedgerError("引擎状态版本不一致")
+        if inner.get("stage") == "structure":
+            expected = list(inner["source_hashes"].values()) + [x["sha256"] for x in inner.get("failures", [])]
+            if not set(state["issued_questions"]) <= set(inner["issued_questions"]):
+                raise LedgerError("引擎问题与当前批次不一致")
+        else:
+            expected = [source["sha256"] for source in inner["plan"]["sources"]]
+            if set(state["issued_questions"]).intersection(inner["decisions"]):
+                raise LedgerError("当前问题已被引擎处理，需要核对中断提交")
+        actual = [digest(Path(value)) for value in inner["inputs"]]
+        if Counter(actual) != Counter(expected):
+            raise LedgerError("输入指纹变化，不能继续使用旧决定，也不能自动重新 run")
+        pending = load_json(Path(snapshot["answer_file"]))
+        if (pending.get("batch_id") != state["batch_id"] or
+                pending.get("state_version") != state["state_version"] or
+                not isinstance(pending.get("answers"), dict) or
+                not set(pending["answers"]) <= set(state["issued_questions"])):
+            raise LedgerError("当前答案文件与待处理批次不一致")
+        checks.update(inputs="fingerprints_verified", engine_state="verified", answer_batch="verified")
+    result = copy.deepcopy(snapshot)
+    result["workflow"] = workflow_progress(state["reply"], paused=not resume)
+    result["resume_checks"] = checks
+    if snapshot["kind"] in HANDOFFS:
+        result["questions"] = [{"question_id": key, "details_required": True,
+                                "detail_command": command("question", state=path, id=key)}
+                               for key in state["issued_questions"]]
+    return result
 
 
 class ProtocolParser(argparse.ArgumentParser):
@@ -88,7 +164,8 @@ def save_reply(path: Path, state: dict, reply: dict) -> dict:
     batch = stable_id("batch", state["session_id"], version)
     state["batch_id"] = batch
     answers_path = path.with_name(f"answers-{version}.json")
-    result = {"kind": reply["kind"], "state": str(path), "state_version": version, "batch_id": batch}
+    result = {"kind": reply["kind"], "state": str(path), "state_version": version, "batch_id": batch,
+              "workflow": workflow_progress(reply)}
     if reply["kind"] == "result":
         result.update({key: reply[key] for key in ("output", "files", "summary", "checks")})
         result["delivery"] = copy.deepcopy(reply["delivery"])
@@ -284,7 +361,9 @@ def main(argv: list[str] | None = None) -> int:
     for action in ("status", "resolve", "question", "inspect"):
         child = sub.add_parser(action)
         child.add_argument("--state", type=Path, required=True)
-        if action == "resolve":
+        if action == "status":
+            child.add_argument("--resume", action="store_true", help="核验成功后显示当前阶段恢复执行；不重新 run/resolve")
+        elif action == "resolve":
             child.add_argument("--answers", type=Path, required=True)
         elif action == "question":
             child.add_argument("--id", required=True)
@@ -300,6 +379,7 @@ def main(argv: list[str] | None = None) -> int:
         args = parser.parse_args(argv)
         if args.action == "doctor":
             result = engine(["doctor"])
+            result["workflow"] = workflow_progress(result)
         elif args.action == "run":
             if not 4000 <= args.response_chars <= 12000:
                 raise LedgerError("response-chars 须为4000到12000")
@@ -307,10 +387,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             args.state = args.state.expanduser().resolve(strict=True)
             if args.action == "status":
-                state = load_session(args.state)
-                if state.get("inflight"):
-                    raise LedgerError("上次引擎提交中断，请核对会话与引擎状态")
-                result = state["snapshot"]
+                result = checked_status(args.state, resume=args.resume)
             elif args.action == "resolve":
                 result = submit(args.state, args.answers)
             elif args.action == "question":
@@ -323,7 +400,18 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except (LedgerError, OSError, ValueError, TypeError, KeyError) as exc:
         message = str(exc) if isinstance(exc, LedgerError) else f"Agent 输入或状态无效 ({type(exc).__name__})"
-        print(encoded({"kind": "error", "message": message[:2000], "message_truncated": len(message) > 2000}), flush=True)
+        error = {"kind": "error", "message": message[:2000], "message_truncated": len(message) > 2000}
+        last = error
+        try:
+            if "args" in locals() and getattr(args, "state", None):
+                last = load_session(args.state)["reply"]
+        except (LedgerError, OSError, ValueError, TypeError, KeyError):
+            pass
+        if last.get("kind") == "result":
+            last = {**last, "validated": False}
+        error["workflow"] = workflow_progress(last, paused=True)
+        error["workflow"]["activity"] = "failed"
+        print(encoded(error), flush=True)
         return 2
 
 

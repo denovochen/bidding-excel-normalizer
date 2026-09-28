@@ -23,7 +23,7 @@ from ledger_core.workbook import (apply_plan_patch, compact_inspection, describe
 from ledger_core import workflow
 
 
-PROGRESS_TITLES = ("读取并检查 Excel", "清洗并整理数据", "生成并校验结果")
+PROGRESS_TITLES = ("读取并检查Excel", "清洗并整理数据", "生成并校验结果")
 
 
 def main(argv: list[str] | None = None, *, emit=None) -> int:

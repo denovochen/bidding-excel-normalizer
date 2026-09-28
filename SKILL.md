@@ -5,12 +5,18 @@ description: 整理结构陌生的 XLS/XLSX 招投标台账；解释表头与区
 
 使用已准备好的 Python 环境；依赖缺失时报告，不临时安装。先检查环境，再用平台入口处理原文件，输出指定到本次任务的空目录：
 
+右侧待办固定且仅有3项：**读取并检查Excel、清洗并整理数据、生成并校验结果**。原样把脚本返回的 `workflow.todos` 交给 `write_todos`；不改名、不拆分、不根据思考过程猜状态。结构判断、项目关联和中标确认都是第二项的内部阶段，不另建待办。
+
 ```bash
 python <Skill目录>/scripts/excel_agent.py doctor
 python <Skill目录>/scripts/excel_agent.py run <Excel路径> [...] --output <任务目录>/outputs/<本次结果目录>
 ```
 
 正常交接退出码0，按 `kind` 推进。返回的 `state` 是 Agent 会话，不能混用旧 CLI 的 state。每轮只修改返回的 `answer_file` 中 `answers`，保留 `batch_id`、`state_version`；执行原样返回的 `next_command`。历史答案由程序保存，不复制到新批次。
+
+恢复或发现已有会话时，先执行 `python <Skill目录>/scripts/excel_agent.py status --resume --state <已有session.json>`。只有 `resume_checks` 通过，才同步返回的待办并按当前批次和 `next_command` 继续；不得重新 run、重做已提交的结构分析或覆盖历史答案。只查看状态不恢复时省略 `--resume`。核验失败时报告，不猜测旧步骤是否完成。
+
+答案模板已由程序生成。用 `edit_file` 局部修改必要字段，每个替换片段保持简短（不超过256字），依据只写必要判断；不使用 `write_file` 整体重写长答案，不重复叙述已确定的分析。长单参数可能被模型服务的工具解析器缓冲，应减少单次参数长度。
 
 - `mapping_required`：模型内部判断，首次读 [结构语义判断](references/semantic-review.md)。按当前问题解释列角色、区域布局和表关系。Python 编译 plan、分块及去重，不手写分组参数。
 - `relationship_review_required`：读 [项目关系复核](references/relation-review.md)。按项目身份选择有依据的候选；同名多候选、主工程/追加工程差异不能靠排序或中标企业消除。不确定就保留复核。

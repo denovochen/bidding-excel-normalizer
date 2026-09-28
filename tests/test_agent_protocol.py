@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import openpyxl
 
@@ -58,6 +59,79 @@ class AgentProtocolTests(unittest.TestCase):
         self.assertEqual(process.stderr, "")
         self.assertTrue(Path(reply["answer_file"]).exists())
         self.assertIn("answer_roles", reply)
+
+    def test_fixed_three_todos_follow_engine_handoffs_and_pause(self):
+        names = ["读取并检查Excel", "清洗并整理数据", "生成并校验结果"]
+        for kind in agent.HANDOFFS:
+            progress = agent.workflow_progress({"kind": kind, "stage": "structure"})
+            self.assertEqual([x["content"] for x in progress["todos"]], names)
+            self.assertEqual([x["status"] for x in progress["todos"]], ["completed", "in_progress", "pending"])
+            paused = agent.workflow_progress({"kind": kind}, paused=True)
+            self.assertNotIn("in_progress", [x["status"] for x in paused["todos"]])
+        done = agent.workflow_progress({"kind": "result", "validated": True})
+        self.assertEqual([x["status"] for x in done["todos"]], ["completed"] * 3)
+
+    def test_resume_status_checks_existing_batch_without_running_engine_or_changing_files(self):
+        reply = self.run_start()
+        state = Path(reply["state"])
+        answers = self.answers(reply)
+        original_state, original_answers = state.read_bytes(), answers.read_bytes()
+        with patch.object(agent, "engine", side_effect=AssertionError("不得重新执行引擎")):
+            checked = agent.checked_status(state)
+        self.assertEqual(checked["batch_id"], reply["batch_id"])
+        self.assertEqual(checked["resume_checks"]["inputs"], "fingerprints_verified")
+        self.assertEqual(checked["workflow"]["activity"], "paused")
+        resumed = agent.checked_status(state, resume=True)
+        self.assertEqual(resumed["workflow"]["activity"], "running")
+        self.assertEqual(resumed["batch_id"], reply["batch_id"])
+        self.assertEqual(state.read_bytes(), original_state)
+        self.assertEqual(answers.read_bytes(), original_answers)
+
+    def test_resume_rejects_changed_input_and_stale_answer_batch(self):
+        reply = self.run_start()
+        state = Path(reply["state"])
+        answer_path = Path(reply["answer_file"])
+        original = answer_path.read_bytes()
+        data = load_json(answer_path)
+        data["state_version"] = 99
+        answer_path.write_text(json.dumps(data), encoding="utf-8")
+        with self.assertRaisesRegex(LedgerError, "答案文件"):
+            agent.checked_status(state)
+        answer_path.write_bytes(original)
+        source = self.root / "含 空格输入.xlsx"
+        source.write_bytes(source.read_bytes() + b"changed")
+        with self.assertRaisesRegex(LedgerError, "输入指纹"):
+            agent.checked_status(state)
+
+    def test_old_snapshot_without_progress_is_readable_and_receipt_tampering_is_rejected(self):
+        reply = self.run_start()
+        state = Path(reply["state"])
+        old = load_json(state)
+        old["snapshot"].pop("workflow")
+        state.write_text(json.dumps(old), encoding="utf-8")
+        self.assertEqual(len(agent.checked_status(state)["workflow"]["todos"]), 3)
+        old["receipts"]["unrecorded_batch"] = "unexpected"
+        state.write_text(json.dumps(old), encoding="utf-8")
+        with self.assertRaisesRegex(LedgerError, "回执数量"):
+            agent.checked_status(state)
+        old["receipts"].clear()
+        state.write_text(json.dumps(old), encoding="utf-8")
+        agent.submit(state, self.answers(reply))
+        submitted = state.with_name("submitted-1.json")
+        submitted.write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(LedgerError, "回执"):
+            agent.checked_status(state)
+
+    def test_failed_artifact_recheck_does_not_report_three_completed_todos(self):
+        reply = self.run_start()
+        result = agent.submit(Path(reply["state"]), self.answers(reply))
+        (Path(result["output"]) / "review_queue.csv").unlink()
+        process = subprocess.run([sys.executable, str(ROOT / "scripts/excel_agent.py"), "status",
+                                  "--state", reply["state"]], capture_output=True, text=True, timeout=30)
+        self.assertEqual(process.returncode, 2)
+        error = json.loads(process.stdout)
+        self.assertEqual(error["workflow"]["activity"], "failed")
+        self.assertEqual([t["status"] for t in error["workflow"]["todos"]], ["completed", "completed", "pending"])
 
     def test_invalid_cli_arguments_also_return_json_without_traceback(self):
         process = subprocess.run([sys.executable, str(ROOT / "scripts/excel_agent.py"), "inspect",
